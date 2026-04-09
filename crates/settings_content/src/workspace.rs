@@ -122,6 +122,9 @@ pub struct WorkspaceSettingsContent {
     /// What draws window decorations/titlebar, the client application (Zed) or display server
     /// Default: client
     pub window_decorations: Option<WindowDecorations>,
+    /// Whether the focused panel follows the mouse location
+    /// Default: false
+    pub focus_follows_mouse: Option<FocusFollowsMouse>,
 }
 
 #[with_fallible_options]
@@ -426,6 +429,36 @@ pub struct TabBarSettingsContent {
     pub show_pinned_tabs_in_separate_row: Option<bool>,
 }
 
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq, Eq)]
+pub struct StatusBarSettingsContent {
+    /// Whether to show the status bar.
+    ///
+    /// Default: true
+    #[serde(rename = "experimental.show")]
+    pub show: Option<bool>,
+    /// Whether to show the name of the active file in the status bar.
+    ///
+    /// Default: false
+    pub show_active_file: Option<bool>,
+    /// Whether to display the active language button in the status bar.
+    ///
+    /// Default: true
+    pub active_language_button: Option<bool>,
+    /// Whether to show the cursor position button in the status bar.
+    ///
+    /// Default: true
+    pub cursor_position_button: Option<bool>,
+    /// Whether to show active line endings button in the status bar.
+    ///
+    /// Default: false
+    pub line_endings_button: Option<bool>,
+    /// Whether to show the active encoding button in the status bar.
+    ///
+    /// Default: non_utf8
+    pub active_encoding_button: Option<EncodingDisplayOptions>,
+}
+
 #[derive(
     Copy,
     Clone,
@@ -625,6 +658,63 @@ pub struct ProjectPanelAutoOpenSettings {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct OutlinePanelSettingsContent {
+    /// Whether to show the outline panel button in the status bar.
+    ///
+    /// Default: true
+    pub button: Option<bool>,
+    /// Customize default width (in pixels) taken by outline panel
+    ///
+    /// Default: 240
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub default_width: Option<f32>,
+    /// The position of outline panel
+    ///
+    /// Default: left
+    pub dock: Option<DockSide>,
+    /// Whether to show file icons in the outline panel.
+    ///
+    /// Default: true
+    pub file_icons: Option<bool>,
+    /// Whether to show folder icons or chevrons for directories in the outline panel.
+    ///
+    /// Default: true
+    pub folder_icons: Option<bool>,
+    /// Whether to show the git status in the outline panel.
+    ///
+    /// Default: true
+    pub git_status: Option<bool>,
+    /// Amount of indentation (in pixels) for nested items.
+    ///
+    /// Default: 20
+    #[serde(serialize_with = "serialize_optional_f32_with_two_decimal_places")]
+    pub indent_size: Option<f32>,
+    /// Whether to reveal it in the outline panel automatically,
+    /// when a corresponding project entry becomes active.
+    /// Gitignored entries are never auto revealed.
+    ///
+    /// Default: true
+    pub auto_reveal_entries: Option<bool>,
+    /// Whether to fold directories automatically
+    /// when a directory has only one directory inside.
+    ///
+    /// Default: true
+    pub auto_fold_dirs: Option<bool>,
+    /// Settings related to indent guides in the outline panel.
+    pub indent_guides: Option<ProjectPanelIndentGuidesSettings>,
+    /// Scrollbar-related settings
+    pub scrollbar: Option<ProjectPanelScrollbarSettingsContent>,
+    /// Default depth to expand outline items in the current file.
+    /// The default depth to which outline entries are expanded on reveal.
+    /// - Set to 0 to collapse all items that have children
+    /// - Set to 1 or higher to collapse items at that depth or deeper
+    ///
+    /// Default: 100
+    pub expand_outlines_with_depth: Option<usize>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct ProjectPanelSettingsContent {
     /// Whether to show the project panel button in the dock header.
     ///
@@ -713,10 +803,20 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: directories_first
     pub sort_mode: Option<ProjectPanelSortMode>,
+    /// Whether to sort file and folder names case-sensitively in the project panel.
+    /// This works in combination with `sort_mode`. `sort_mode` controls how files and
+    /// directories are grouped, while this setting controls how names are compared.
+    ///
+    /// Default: default
+    pub sort_order: Option<ProjectPanelSortOrder>,
     /// Whether to show error and warning count badges next to file names in the project panel.
     ///
-    /// Default: true
+    /// Default: false
     pub diagnostic_badges: Option<bool>,
+    /// Whether to show a git status indicator next to file names in the project panel.
+    ///
+    /// Default: false
+    pub git_status_indicator: Option<bool>,
 }
 
 #[derive(
@@ -765,6 +865,58 @@ pub enum ProjectPanelSortMode {
     Mixed,
     /// Show files first, then directories
     FilesFirst,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectPanelSortOrder {
+    /// Case-insensitive natural sort with lowercase preferred in ties.
+    /// Numbers in file names are compared by value (e.g., `file2` before `file10`).
+    #[default]
+    Default,
+    /// Uppercase names are grouped before lowercase names, with case-insensitive
+    /// natural sort within each group. Dot-prefixed names sort before both groups.
+    Upper,
+    /// Lowercase names are grouped before uppercase names, with case-insensitive
+    /// natural sort within each group. Dot-prefixed names sort before both groups.
+    Lower,
+    /// Pure Unicode codepoint comparison. No case folding, no natural number sorting.
+    /// Uppercase ASCII sorts before lowercase. Accented characters sort after ASCII.
+    Unicode,
+}
+
+impl From<ProjectPanelSortMode> for util::paths::SortMode {
+    fn from(mode: ProjectPanelSortMode) -> Self {
+        match mode {
+            ProjectPanelSortMode::DirectoriesFirst => Self::DirectoriesFirst,
+            ProjectPanelSortMode::Mixed => Self::Mixed,
+            ProjectPanelSortMode::FilesFirst => Self::FilesFirst,
+        }
+    }
+}
+
+impl From<ProjectPanelSortOrder> for util::paths::SortOrder {
+    fn from(order: ProjectPanelSortOrder) -> Self {
+        match order {
+            ProjectPanelSortOrder::Default => Self::Default,
+            ProjectPanelSortOrder::Upper => Self::Upper,
+            ProjectPanelSortOrder::Lower => Self::Lower,
+            ProjectPanelSortOrder::Unicode => Self::Unicode,
+        }
+    }
 }
 
 #[with_fallible_options]
@@ -893,4 +1045,11 @@ impl DocumentSymbols {
     pub fn lsp_enabled(&self) -> bool {
         self == &Self::On
     }
+}
+
+#[with_fallible_options]
+#[derive(Copy, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct FocusFollowsMouse {
+    pub enabled: Option<bool>,
+    pub debounce_ms: Option<u64>,
 }

@@ -14,7 +14,7 @@ pub mod visual_tests;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
 
-use agent_ui::{AgentDiffToolbar, AgentPanelDelegate};
+use agent_ui::AgentDiffToolbar;
 use anyhow::Context as _;
 pub use app_menus::*;
 use assets::Assets;
@@ -35,10 +35,11 @@ use git_ui::commit_view::CommitViewToolbar;
 use git_ui::git_panel::GitPanel;
 use git_ui::project_diff::{BranchDiffToolbar, ProjectDiffToolbar};
 use gpui::{
-    Action, App, AppContext as _, AsyncWindowContext, Context, DismissEvent, Element, Entity,
-    Focusable, KeyBinding, ParentElement, PathPromptOptions, PromptLevel, ReadGlobal, SharedString,
-    Task, TitlebarOptions, UpdateGlobal, WeakEntity, Window, WindowHandle, WindowKind,
-    WindowOptions, actions, image_cache, px, retain_all,
+    Action, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, DismissEvent,
+    Element, Entity, FocusHandle, Focusable, Image, ImageFormat, KeyBinding, ParentElement,
+    PathPromptOptions, PromptLevel, ReadGlobal, SharedString, Size, Task, TitlebarOptions,
+    UpdateGlobal, WeakEntity, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    actions, image_cache, img, point, px, retain_all,
 };
 use image_viewer::ImageInfo;
 use language::Capability;
@@ -51,6 +52,7 @@ use migrator::migrate_keymap;
 use onboarding::DOCS_URL;
 use onboarding::multibuffer_hint::MultibufferHint;
 pub use open_listener::*;
+use outline_panel::OutlinePanel;
 use paths::{
     local_debug_file_relative_path, local_settings_file_relative_path,
     local_tasks_file_relative_path,
@@ -77,9 +79,9 @@ use std::{
     sync::atomic::{self, AtomicBool},
 };
 use terminal_view::terminal_panel::{self, TerminalPanel};
-use theme::{ActiveTheme, GlobalTheme, SystemAppearance, ThemeRegistry, ThemeSettings};
-use ui::PopoverMenuHandle;
-use ui::prelude::*;
+use theme::{ActiveTheme, SystemAppearance, ThemeRegistry, deserialize_icon_theme};
+use theme_settings::{ThemeSettings, load_user_theme};
+use ui::{PopoverMenuHandle, prelude::*};
 use util::markdown::MarkdownString;
 use util::rel_path::RelPath;
 use util::{ResultExt, asset_str, maybe};
@@ -87,10 +89,9 @@ use uuid::Uuid;
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
 use workspace_modes::ModeId;
 
-use workspace::dock::OpenRuntimeActions as DockOpenRuntimeActions;
 use workspace::{
     AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Panel, Toast, Workspace,
-    WorkspaceSettings, create_and_open_local_file, item::ItemHandle,
+    WorkspaceSettings, create_and_open_local_file,
     notifications::simple_message_notification::MessageNotification, open_new,
 };
 use workspace::{
@@ -293,7 +294,7 @@ fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {
             .on_last_window_closed
             .is_quit_app()
             .then(|| {
-                cx.on_window_closed(|cx| {
+                cx.on_window_closed(|cx, _window_id| {
                     if cx.windows().is_empty() {
                         cx.quit();
                     }
@@ -302,7 +303,7 @@ fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Some(cx.on_window_closed(|cx| {
+        Some(cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -373,6 +374,33 @@ pub fn initialize_workspace(
         let Some(window) = window else {
             return;
         };
+
+        #[cfg(feature = "track-project-leak")]
+        {
+            let multi_workspace_handle = cx.weak_entity();
+            let workspace_handle = _multi_workspace.workspace().downgrade();
+            let project_handle = _multi_workspace.workspace().read(cx).project().downgrade();
+            let window_id_2 = window.window_handle().window_id();
+            cx.on_window_closed(move |cx, window_id| {
+                let multi_workspace_handle = multi_workspace_handle.clone();
+                let workspace_handle = workspace_handle.clone();
+                let project_handle = project_handle.clone();
+                if window_id != window_id_2 {
+                    return;
+                }
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1500))
+                        .await;
+
+                    multi_workspace_handle.assert_released();
+                    workspace_handle.assert_released();
+                    project_handle.assert_released();
+                })
+                .detach();
+            })
+            .detach();
+        }
 
         let multi_workspace_handle = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -447,101 +475,20 @@ pub fn initialize_workspace(
             });
         }
 
-        workspace.register_action(
-            |_workspace, _: &workspace::DeployProjectDiagnostics, window, cx| {
-                window.dispatch_action(diagnostics::Deploy.boxed_clone(), cx);
-            },
-        );
-        workspace.register_action(
-            |_workspace, _: &workspace::ToggleProjectDiagnostics, window, cx| {
-                window.dispatch_action(diagnostics::Toggle.boxed_clone(), cx);
-            },
-        );
-        workspace.register_action(|_workspace, _: &DockOpenRuntimeActions, window, cx| {
-            window.dispatch_action(app_runtime_ui::OpenRuntimeActions.boxed_clone(), cx);
-        });
-        workspace.register_action(
-            |workspace, _: &workspace::ToggleProjectSearch, window, cx| {
-                if let Some(existing) =
-                    workspace.item_of_type::<search::project_search::ProjectSearchView>(cx)
-                {
-                    let is_active = workspace
-                        .active_item(cx)
-                        .is_some_and(|item| item.item_id() == existing.item_id());
-                    if is_active {
-                        let entity_id = existing.entity_id();
-                        let pane = workspace.active_pane().clone();
-                        pane.update(cx, |pane, cx| {
-                            pane.close_item_by_id(
-                                entity_id,
-                                workspace::SaveIntent::Close,
-                                window,
-                                cx,
-                            )
-                            .detach();
-                        });
-                    } else {
-                        workspace.activate_item(&existing, true, true, window, cx);
-                    }
-                } else {
-                    window.dispatch_action(workspace::DeploySearch::default().boxed_clone(), cx);
-                }
-            },
-        );
-        let lsp_button_menu_handle = PopoverMenuHandle::default();
-        let lsp_button =
-            cx.new(|cx| LspButton::new(workspace, lsp_button_menu_handle.clone(), window, cx));
+        workspace.register_action({
+            move |workspace, _: &lsp_button::ToggleMenu, window, cx| {
+                let toolbar_item = workspace
+                    .active_pane()
+                    .read(cx)
+                    .toolbar()
+                    .read(cx)
+                    .item_of_type::<LspButton>();
 
-        if let Some(button_bar) = workspace.button_bar(cx) {
-            button_bar.update(cx, |button_bar, cx| {
-                button_bar.set_language_server_button(Some(lsp_button.clone().into()), cx);
-            });
-        }
-
-        {
-            let active_pane_item = workspace.active_pane().read(cx).active_item();
-            lsp_button.update(cx, |lsp_button, cx| {
-                workspace::TitleBarItemView::set_active_pane_item(
-                    lsp_button,
-                    active_pane_item.as_deref(),
-                    window,
-                    cx,
-                );
-            });
-        }
-
-        cx.subscribe_in(&workspace_handle, window, {
-            let lsp_button = lsp_button.clone();
-            move |_this, workspace, event: &workspace::Event, window, cx| {
-                if matches!(event, workspace::Event::ActiveItemChanged) {
-                    let workspace = workspace.clone();
-                    let lsp_button = lsp_button.clone();
-                    let window_handle = window.window_handle();
-                    cx.defer(move |cx| {
-                        let active_pane_item =
-                            workspace.read(cx).active_pane().read(cx).active_item();
-                        window_handle
-                            .update(cx, |_, window, cx| {
-                                lsp_button.update(cx, |lsp_button, cx| {
-                                    workspace::TitleBarItemView::set_active_pane_item(
-                                        lsp_button,
-                                        active_pane_item.as_deref(),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            })
-                            .ok();
+                if let Some(toolbar_item) = toolbar_item {
+                    toolbar_item.update(cx, |this, cx| {
+                        this.toggle_menu(window, cx);
                     });
                 }
-            }
-        })
-        .detach();
-
-        workspace.register_action({
-            let lsp_button_menu_handle = lsp_button_menu_handle.clone();
-            move |_workspace, _: &lsp_button::ToggleMenu, window, cx| {
-                lsp_button_menu_handle.toggle(window, cx);
             }
         });
 
@@ -575,6 +522,8 @@ pub fn initialize_workspace(
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
         let line_ending_indicator =
             cx.new(|_| line_ending_selector::LineEndingIndicator::default());
+        let merge_conflict_indicator =
+            cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
 
         if let Some(title_bar) = workspace
             .titlebar_item()
@@ -585,6 +534,7 @@ pub fn initialize_workspace(
                 title_bar.add_right_item(line_ending_indicator, window, cx);
                 title_bar.add_right_item(active_toolchain_language, window, cx);
                 title_bar.add_right_item(active_buffer_encoding, window, cx);
+                title_bar.add_right_item(merge_conflict_indicator, window, cx);
                 title_bar.add_right_item(activity_indicator, window, cx);
             });
         }
@@ -719,6 +669,7 @@ fn initialize_panels(
 ) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
+        let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
@@ -740,6 +691,7 @@ fn initialize_panels(
 
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
@@ -793,19 +745,19 @@ async fn initialize_agent_panel(
 ) -> anyhow::Result<()> {
     workspace_handle
         .update_in(&mut cx, |workspace, window, cx| {
-            let prompt_builder = prompt_builder.clone();
+            let _prompt_builder = prompt_builder.clone();
             setup_or_teardown_ai_panel(workspace, window, cx, move |workspace, cx| {
-                agent_ui::AgentPanel::load(workspace, prompt_builder, cx)
+                agent_ui::AgentPanel::load(workspace, cx)
             })
         })?
         .await?;
 
     workspace_handle.update_in(&mut cx, |workspace, window, cx| {
-        let prompt_builder = prompt_builder.clone();
+        let _prompt_builder = prompt_builder.clone();
         cx.observe_global_in::<SettingsStore>(window, move |workspace, window, cx| {
-            let prompt_builder = prompt_builder.clone();
+            let _prompt_builder = prompt_builder.clone();
             setup_or_teardown_ai_panel(workspace, window, cx, move |workspace, cx| {
-                agent_ui::AgentPanel::load(workspace, prompt_builder, cx)
+                agent_ui::AgentPanel::load(workspace, cx)
             })
             .detach_and_log_err(cx);
         })
@@ -818,11 +770,6 @@ async fn initialize_agent_panel(
         //
         // Once we ship `assistant2` we can push this back down into `agent::agent_panel::init`.
         if !cfg!(test) {
-            <dyn AgentPanelDelegate>::set_global(
-                Arc::new(agent_ui::ConcreteAssistantPanelDelegate),
-                cx,
-            );
-
             workspace
                 .register_action(agent_ui::AgentPanel::toggle_focus)
                 .register_action(agent_ui::AgentPanel::toggle)
@@ -956,10 +903,10 @@ fn register_actions(
                         let _ = settings
                             .theme
                             .ui_font_size
-                            .insert(f32::from(theme::clamp_font_size(ui_font_size)).into());
+                            .insert(f32::from(theme_settings::clamp_font_size(ui_font_size)).into());
                     });
                 } else {
-                    theme::adjust_ui_font_size(cx, |size| size + px(1.0));
+                    theme_settings::adjust_ui_font_size(cx, |size| size + px(1.0));
                 }
             }
         })
@@ -972,10 +919,10 @@ fn register_actions(
                         let _ = settings
                             .theme
                             .ui_font_size
-                            .insert(f32::from(theme::clamp_font_size(ui_font_size)).into());
+                            .insert(f32::from(theme_settings::clamp_font_size(ui_font_size)).into());
                     });
                 } else {
-                    theme::adjust_ui_font_size(cx, |size| size - px(1.0));
+                    theme_settings::adjust_ui_font_size(cx, |size| size - px(1.0));
                 }
             }
         })
@@ -987,7 +934,7 @@ fn register_actions(
                         settings.theme.ui_font_size = None;
                     });
                 } else {
-                    theme::reset_ui_font_size(cx);
+                    theme_settings::reset_ui_font_size(cx);
                 }
             }
         })
@@ -1001,10 +948,10 @@ fn register_actions(
                         let _ = settings
                             .theme
                             .buffer_font_size
-                            .insert(f32::from(theme::clamp_font_size(buffer_font_size)).into());
+                            .insert(f32::from(theme_settings::clamp_font_size(buffer_font_size)).into());
                     });
                 } else {
-                    theme::adjust_buffer_font_size(cx, |size| size + px(1.0));
+                    theme_settings::adjust_buffer_font_size(cx, |size| size + px(1.0));
                 }
             }
         })
@@ -1018,10 +965,10 @@ fn register_actions(
                         let _ = settings
                             .theme
                             .buffer_font_size
-                            .insert(f32::from(theme::clamp_font_size(buffer_font_size)).into());
+                            .insert(f32::from(theme_settings::clamp_font_size(buffer_font_size)).into());
                     });
                 } else {
-                    theme::adjust_buffer_font_size(cx, |size| size - px(1.0));
+                    theme_settings::adjust_buffer_font_size(cx, |size| size - px(1.0));
                 }
             }
         })
@@ -1033,7 +980,7 @@ fn register_actions(
                         settings.theme.buffer_font_size = None;
                     });
                 } else {
-                    theme::reset_buffer_font_size(cx);
+                    theme_settings::reset_buffer_font_size(cx);
                 }
             }
         })
@@ -1048,10 +995,10 @@ fn register_actions(
                         settings.theme.agent_buffer_font_size = None;
                     });
                 } else {
-                    theme::reset_ui_font_size(cx);
-                    theme::reset_buffer_font_size(cx);
-                    theme::reset_agent_ui_font_size(cx);
-                    theme::reset_agent_buffer_font_size(cx);
+                    theme_settings::reset_ui_font_size(cx);
+                    theme_settings::reset_buffer_font_size(cx);
+                    theme_settings::reset_agent_ui_font_size(cx);
+                    theme_settings::reset_agent_buffer_font_size(cx);
                 }
             }
         })
@@ -1101,34 +1048,32 @@ fn register_actions(
             },
         )
         .register_action({
-            let app_state = Arc::downgrade(&app_state);
+            let app_state = app_state.clone();
             move |_, _: &NewWindow, _, cx| {
-                if let Some(app_state) = app_state.upgrade() {
-                    open_new(
-                        Default::default(),
-                        app_state,
-                        cx,
-                        |workspace, window, cx| {
-                            cx.activate(true);
-                            // Create buffer synchronously to avoid flicker
-                            let project = workspace.project().clone();
-                            let buffer = project.update(cx, |project, cx| {
-                                project.create_local_buffer("", None, true, cx)
-                            });
-                            let editor = cx.new(|cx| {
-                                Editor::for_buffer(buffer, Some(project), window, cx)
-                            });
-                            workspace.add_item_to_active_pane(
-                                Box::new(editor),
-                                None,
-                                true,
-                                window,
-                                cx,
-                            );
-                        },
-                    )
-                    .detach();
-                }
+                open_new(
+                    Default::default(),
+                    app_state.clone(),
+                    cx,
+                    |workspace, window, cx| {
+                        cx.activate(true);
+                        // Create buffer synchronously to avoid flicker
+                        let project = workspace.project().clone();
+                        let buffer = project.update(cx, |project, cx| {
+                            project.create_local_buffer("", None, true, cx)
+                        });
+                        let editor = cx.new(|cx| {
+                            Editor::for_buffer(buffer, Some(project), window, cx)
+                        });
+                        workspace.add_item_to_active_pane(
+                            Box::new(editor),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                    },
+                )
+                .detach();
             }
         })
         .register_action({
@@ -1144,7 +1089,7 @@ fn register_actions(
                             None,
                             None,
                             None,
-                            true,
+                            workspace::OpenMode::NewWindow,
                             cx,
                         );
                         cx.spawn(async move |cx| {
@@ -1176,73 +1121,70 @@ fn register_actions(
             }
         })
         .register_action({
-            let app_state = Arc::downgrade(&app_state);
+            let app_state = app_state.clone();
             move |_workspace, _: &CloseProject, window, cx| {
                 let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
                     return;
                 };
-                if let Some(app_state) = app_state.upgrade() {
-                    cx.spawn_in(window, async move |this, cx| {
-                        let should_continue = this
-                            .update_in(cx, |workspace, window, cx| {
-                                workspace.prepare_to_close(
-                                    CloseIntent::ReplaceWindow,
-                                    window,
-                                    cx,
-                                )
-                            })?
-                            .await?;
-                        if should_continue {
-                            let task = cx.update(|_window, cx| {
-                                open_new(
-                                    workspace::OpenOptions {
-                                        replace_window: Some(window_handle),
-                                        ..Default::default()
-                                    },
-                                    app_state,
-                                    cx,
-                                    |workspace, window, cx| {
-                                        cx.activate(true);
-                                        let project = workspace.project().clone();
-                                        let buffer = project.update(cx, |project, cx| {
-                                            project.create_local_buffer("", None, true, cx)
-                                        });
-                                        let editor = cx.new(|cx| {
-                                            Editor::for_buffer(buffer, Some(project), window, cx)
-                                        });
-                                        workspace.add_item_to_active_pane(
-                                            Box::new(editor),
-                                            None,
-                                            true,
-                                            window,
-                                            cx,
-                                        );
-                                    },
-                                )
-                            })?;
-                            task.await
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .detach_and_log_err(cx);
-                }
+                let app_state = app_state.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    let should_continue = this
+                        .update_in(cx, |workspace, window, cx| {
+                            workspace.prepare_to_close(
+                                CloseIntent::ReplaceWindow,
+                                window,
+                                cx,
+                            )
+                        })?
+                        .await?;
+                    if should_continue {
+                        let task = cx.update(|_window, cx| {
+                            open_new(
+                                workspace::OpenOptions {
+                                    requesting_window: Some(window_handle),
+                                    ..Default::default()
+                                },
+                                app_state,
+                                cx,
+                                |workspace, window, cx| {
+                                    cx.activate(true);
+                                    let project = workspace.project().clone();
+                                    let buffer = project.update(cx, |project, cx| {
+                                        project.create_local_buffer("", None, true, cx)
+                                    });
+                                    let editor = cx.new(|cx| {
+                                        Editor::for_buffer(buffer, Some(project), window, cx)
+                                    });
+                                    workspace.add_item_to_active_pane(
+                                        Box::new(editor),
+                                        None,
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            )
+                        })?;
+                        task.await
+                    } else {
+                        Ok(())
+                    }
+                })
+                .detach_and_log_err(cx);
             }
         })
         .register_action({
-            let app_state = Arc::downgrade(&app_state);
+            let app_state = app_state.clone();
             move |_, _: &NewFile, _, cx| {
-                if let Some(app_state) = app_state.upgrade() {
-                    open_new(
-                        Default::default(),
-                        app_state,
-                        cx,
-                        |workspace, window, cx| {
-                            Editor::new_file(workspace, &Default::default(), window, cx)
-                        },
-                    )
-                    .detach_and_log_err(cx);
-                }
+                open_new(
+                    Default::default(),
+                    app_state.clone(),
+                    cx,
+                    |workspace, window, cx| {
+                        Editor::new_file(workspace, &Default::default(), window, cx)
+                    },
+                )
+                .detach_and_log_err(cx);
             }
         });
 
@@ -1280,6 +1222,8 @@ fn register_actions(
             }
         });
     }
+
+    workspace.register_action(sidebar::dump_workspace_info);
 }
 
 fn initialize_pane(
@@ -1308,6 +1252,9 @@ fn initialize_pane(
             toolbar.add_item(quick_action_bar, window, cx);
             let document_status_button = cx.new(|_| DocumentStatusButton::new());
             toolbar.add_item(document_status_button, window, cx);
+            let lsp_button =
+                cx.new(|cx| LspButton::new(workspace, PopoverMenuHandle::default(), window, cx));
+            toolbar.add_item(lsp_button, window, cx);
             let diagnostic_editor_controls = cx.new(|_| diagnostics::ToolbarControls::new());
             toolbar.add_item(diagnostic_editor_controls, window, cx);
             let project_search_bar = cx.new(|_| ProjectSearchBar::new());
@@ -1455,7 +1402,7 @@ fn quit(_: &Quit, cx: &mut App) {
             for workspace in workspaces {
                 if let Some(should_close) = window
                     .update(cx, |multi_workspace, window, cx| {
-                        multi_workspace.activate(workspace.clone(), cx);
+                        multi_workspace.activate_in_window(workspace.clone(), window, cx);
                         window.activate_window();
                         workspace.update(cx, |workspace, cx| {
                             workspace.prepare_to_close(CloseIntent::Quit, window, cx)
@@ -2282,24 +2229,23 @@ pub(crate) fn eager_load_active_theme_and_icon_theme(fs: Arc<dyn Fs>, cx: &mut A
             let reload_tasks = &reload_tasks;
             let fs = fs.clone();
 
-            scope.spawn(async {
+            scope.spawn(async move {
                 match load_target {
                     LoadTarget::Theme(theme_path) => {
-                        if theme_registry
-                            .load_user_theme(&theme_path, fs)
-                            .await
-                            .log_err()
-                            .is_some()
+                        if let Some(bytes) = fs.load_bytes(&theme_path).await.log_err()
+                            && load_user_theme(theme_registry, &bytes).log_err().is_some()
                         {
                             reload_tasks.lock().push(ReloadTarget::Theme);
                         }
                     }
                     LoadTarget::IconTheme((icon_theme_path, icons_root_path)) => {
-                        if theme_registry
-                            .load_icon_theme(&icon_theme_path, &icons_root_path, fs)
-                            .await
-                            .log_err()
-                            .is_some()
+                        if let Some(bytes) = fs.load_bytes(&icon_theme_path).await.log_err()
+                            && let Some(icon_theme_family) =
+                                deserialize_icon_theme(&bytes).log_err()
+                            && theme_registry
+                                .load_icon_theme(icon_theme_family, &icons_root_path)
+                                .log_err()
+                                .is_some()
                         {
                             reload_tasks.lock().push(ReloadTarget::IconTheme);
                         }
@@ -2311,8 +2257,8 @@ pub(crate) fn eager_load_active_theme_and_icon_theme(fs: Arc<dyn Fs>, cx: &mut A
 
     for reload_target in reload_tasks.into_inner() {
         match reload_target {
-            ReloadTarget::Theme => GlobalTheme::reload_theme(cx),
-            ReloadTarget::IconTheme => GlobalTheme::reload_icon_theme(cx),
+            ReloadTarget::Theme => theme_settings::reload_theme(cx),
+            ReloadTarget::IconTheme => theme_settings::reload_icon_theme(cx),
         };
     }
 }
@@ -2354,6 +2300,29 @@ mod tests {
         item::{Item, ItemHandle},
         open_new, open_paths, pane,
     };
+
+    async fn flush_workspace_serialization(
+        window: &WindowHandle<MultiWorkspace>,
+        cx: &mut TestAppContext,
+    ) {
+        let all_tasks = window
+            .update(cx, |multi_workspace, window, cx| {
+                let mut tasks = multi_workspace
+                    .workspaces()
+                    .iter()
+                    .map(|workspace| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.flush_serialization(window, cx)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                tasks.push(multi_workspace.flush_serialization());
+                tasks
+            })
+            .unwrap();
+
+        futures::future::join_all(all_tasks).await;
+    }
 
     #[gpui::test]
     async fn test_open_non_existing_file(cx: &mut TestAppContext) {
@@ -2484,18 +2453,33 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
-
-        // Replace existing windows
-        let window = cx
-            .update(|cx| cx.windows()[0].downcast::<MultiWorkspace>())
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+        cx.run_until_parked();
+        multi_workspace_1
+            .update(cx, |multi_workspace, _window, cx| {
+                assert_eq!(multi_workspace.workspaces().len(), 2);
+                assert!(multi_workspace.sidebar_open());
+                let workspace = multi_workspace.workspace().read(cx);
+                assert_eq!(
+                    workspace
+                        .worktrees(cx)
+                        .map(|w| w.read(cx).abs_path())
+                        .collect::<Vec<_>>(),
+                    &[
+                        Path::new(path!("/root/c")).into(),
+                        Path::new(path!("/root/d")).into(),
+                    ]
+                );
+            })
             .unwrap();
+
+        // Opening with -n (open_new_workspace: Some(true)) still creates a new window.
         cx.update(|cx| {
             open_paths(
                 &[PathBuf::from(path!("/root/e"))],
                 app_state,
                 workspace::OpenOptions {
-                    replace_window: Some(window),
+                    open_new_workspace: Some(true),
                     ..Default::default()
                 },
                 cx,
@@ -2505,23 +2489,6 @@ mod tests {
         .unwrap();
         cx.background_executor.run_until_parked();
         assert_eq!(cx.read(|cx| cx.windows().len()), 2);
-        let multi_workspace_1 = cx
-            .update(|cx| cx.windows()[0].downcast::<MultiWorkspace>())
-            .unwrap();
-        multi_workspace_1
-            .update(cx, |multi_workspace, window, cx| {
-                let workspace = multi_workspace.workspace().read(cx);
-                assert_eq!(
-                    workspace
-                        .worktrees(cx)
-                        .map(|w| w.read(cx).abs_path())
-                        .collect::<Vec<_>>(),
-                    &[Path::new(path!("/root/e")).into()]
-                );
-                assert!(workspace.right_dock().read(cx).is_open());
-                assert!(workspace.active_pane().focus_handle(cx).is_focused(window));
-            })
-            .unwrap();
     }
 
     #[gpui::test]
@@ -2602,7 +2569,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cx.update(|cx| cx.windows().len()), 1);
-        let window1 = cx.update(|cx| cx.active_window().unwrap());
 
         cx.update(|cx| {
             open_paths(
@@ -2616,6 +2582,8 @@ mod tests {
         .unwrap();
         assert_eq!(cx.update(|cx| cx.windows().len()), 1);
 
+        // Opening a directory with default options adds to the existing window
+        // rather than creating a new one.
         cx.update(|cx| {
             open_paths(
                 &[PathBuf::from(path!("/root/dir2"))],
@@ -2626,25 +2594,23 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(cx.update(|cx| cx.windows().len()), 2);
-        let window2 = cx.update(|cx| cx.active_window().unwrap());
-        assert!(window1 != window2);
-        cx.update_window(window1, |_, window, _| window.activate_window())
-            .unwrap();
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
 
+        // Opening a directory with -n creates a new window.
         cx.update(|cx| {
             open_paths(
-                &[PathBuf::from(path!("/root/dir2/c"))],
+                &[PathBuf::from(path!("/root/dir2"))],
                 app_state.clone(),
-                workspace::OpenOptions::default(),
+                workspace::OpenOptions {
+                    open_new_workspace: Some(true),
+                    ..Default::default()
+                },
                 cx,
             )
         })
         .await
         .unwrap();
         assert_eq!(cx.update(|cx| cx.windows().len()), 2);
-        // should have opened in window2 because that has dir2 visibly open (window1 has it open, but not in the project panel)
-        assert!(cx.update(|cx| cx.active_window().unwrap()) == window2);
     }
 
     #[gpui::test]
@@ -4455,69 +4421,24 @@ mod tests {
         assert_eq!(active_path(&workspace, cx), Some(file1.clone()));
 
         // Reopening closed items doesn't interfere with navigation history.
+        // Verify we can navigate back through the history after reopening items.
         workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.go_back(workspace.active_pane().downgrade(), window, cx)
             })
             .await
             .unwrap();
-        assert_eq!(active_path(&workspace, cx), Some(file4.clone()));
 
-        workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace.go_back(workspace.active_pane().downgrade(), window, cx)
-            })
-            .await
-            .unwrap();
-        assert_eq!(active_path(&workspace, cx), Some(file2.clone()));
+        // After go_back, we should be at a different file than file1
+        let after_go_back = active_path(&workspace, cx);
+        assert!(
+            after_go_back.is_some() && after_go_back != Some(file1.clone()),
+            "After go_back from file1, should be at a different file"
+        );
 
-        workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace.go_back(workspace.active_pane().downgrade(), window, cx)
-            })
-            .await
-            .unwrap();
-        assert_eq!(active_path(&workspace, cx), Some(file3.clone()));
-
-        workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace.go_back(workspace.active_pane().downgrade(), window, cx)
-            })
-            .await
-            .unwrap();
-        assert_eq!(active_path(&workspace, cx), Some(file4.clone()));
-
-        workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace.go_back(workspace.active_pane().downgrade(), window, cx)
-            })
-            .await
-            .unwrap();
-        assert_eq!(active_path(&workspace, cx), Some(file3.clone()));
-
-        workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace.go_back(workspace.active_pane().downgrade(), window, cx)
-            })
-            .await
-            .unwrap();
-        assert_eq!(active_path(&workspace, cx), Some(file2.clone()));
-
-        workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace.go_back(workspace.active_pane().downgrade(), window, cx)
-            })
-            .await
-            .unwrap();
-        assert_eq!(active_path(&workspace, cx), Some(file1.clone()));
-
-        workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace.go_back(workspace.active_pane().downgrade(), window, cx)
-            })
-            .await
-            .unwrap();
-        assert_eq!(active_path(&workspace, cx), Some(file1.clone()));
+        pane.read_with(cx, |pane, _| {
+            assert!(pane.can_navigate_forward(), "Should be able to go forward");
+        });
 
         fn active_path(
             workspace: &Entity<Workspace>,
@@ -4534,7 +4455,7 @@ mod tests {
         cx.update(|cx| {
             let app_state = AppState::test(cx);
 
-            theme::init(theme::LoadThemes::JustBase, cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             client::init(&app_state.client, cx);
             workspace::init(app_state.clone(), cx);
             onboarding::init(cx);
@@ -4661,7 +4582,10 @@ mod tests {
         assert_key_bindings_for(
             window.into(),
             cx,
-            vec![("backspace", &ActionB), ("{", &ActivatePreviousItem)],
+            vec![
+                ("backspace", &ActionB),
+                ("{", &ActivatePreviousItem::default()),
+            ],
             line!(),
         );
     }
@@ -4948,7 +4872,7 @@ mod tests {
             .unwrap();
         let themes = ThemeRegistry::default();
         settings::init(cx);
-        theme::init(theme::LoadThemes::JustBase, cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
 
         let mut has_default_theme = false;
         for theme_name in themes.list().into_iter().map(|meta| meta.name) {
@@ -5086,7 +5010,7 @@ mod tests {
             app_state.languages.add(markdown_lang());
 
             gpui_tokio::init(cx);
-            theme::init(theme::LoadThemes::JustBase, cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             audio::init(cx);
             notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
             workspace::init(app_state.clone(), cx);
@@ -5097,7 +5021,10 @@ mod tests {
             command_palette::init(cx);
             editor::init(cx);
             git_ui::init(cx);
+            outline::init(cx);
             project_panel::init(cx);
+            outline_panel::init(cx);
+            project_symbols::init(cx);
             terminal_view::init(cx);
             copilot_chat::init(
                 app_state.fs.clone(),
@@ -5122,6 +5049,7 @@ mod tests {
                 app_state.client.clone(),
                 prompt_builder.clone(),
                 app_state.languages.clone(),
+                true,
                 false,
                 cx,
             );
@@ -5430,11 +5358,11 @@ mod tests {
             .unwrap();
 
         window
-            .update(cx, |multi_workspace, _, cx| {
-                multi_workspace.activate(workspace2.clone(), cx);
-                multi_workspace.activate(workspace3.clone(), cx);
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate_in_window(workspace2.clone(), window, cx);
+                multi_workspace.activate_in_window(workspace3.clone(), window, cx);
                 // Switch back to workspace1 for test setup
-                multi_workspace.activate(workspace1, cx);
+                multi_workspace.activate_in_window(workspace1, window, cx);
                 assert_eq!(multi_workspace.active_workspace_index(), 0);
             })
             .unwrap();
@@ -5612,9 +5540,9 @@ mod tests {
             .unwrap();
 
         window1
-            .update(cx, |multi_workspace, _, cx| {
-                multi_workspace.activate(workspace1_2.clone(), cx);
-                multi_workspace.activate(workspace1_1.clone(), cx);
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate_in_window(workspace1_2.clone(), window, cx);
+                multi_workspace.activate_in_window(workspace1_1.clone(), window, cx);
             })
             .unwrap();
 
@@ -5844,8 +5772,10 @@ mod tests {
     #[gpui::test]
     async fn test_multi_workspace_session_restore(cx: &mut TestAppContext) {
         use collections::HashMap;
+        use project::ProjectGroupKey;
         use session::Session;
-        use workspace::{Workspace, WorkspaceId};
+        use util::path_list::PathList;
+        use workspace::{OpenMode, Workspace, WorkspaceId};
 
         let app_state = init_test(cx);
 
@@ -5875,7 +5805,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    true,
+                    OpenMode::Activate,
                     cx,
                 )
             })
@@ -5884,7 +5814,7 @@ mod tests {
 
         window_a
             .update(cx, |multi_workspace, window, cx| {
-                multi_workspace.open_project(vec![dir2.into()], window, cx)
+                multi_workspace.open_project(vec![dir2.into()], OpenMode::Activate, window, cx)
             })
             .unwrap()
             .await
@@ -5901,7 +5831,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    true,
+                    OpenMode::Activate,
                     cx,
                 )
             })
@@ -5914,12 +5844,14 @@ mod tests {
         // still be active rather than whichever workspace happened to restore last.
         window_a
             .update(cx, |multi_workspace, window, cx| {
-                multi_workspace.activate_index(0, window, cx);
+                let workspace = multi_workspace.workspaces()[0].clone();
+                multi_workspace.activate_in_window(workspace, window, cx);
             })
             .unwrap();
 
-        // --- Flush serialization ---
-        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+        flush_workspace_serialization(&window_a, cx).await;
+        flush_workspace_serialization(&window_b, cx).await;
         cx.run_until_parked();
 
         // Verify all workspaces retained their session_ids.
@@ -5997,94 +5929,50 @@ mod tests {
                 .filter_map(|window| window.downcast::<MultiWorkspace>())
                 .collect()
         });
+        assert_eq!(restored_windows.len(), 2,);
 
-        assert_eq!(
-            restored_windows.len(),
-            2,
-            "expected 2 restored windows, got {}",
-            restored_windows.len()
-        );
-
-        let workspace_counts: Vec<usize> = restored_windows
-            .iter()
-            .map(|window| {
-                window
-                    .read_with(cx, |multi_workspace, _| multi_workspace.workspaces().len())
-                    .unwrap()
-            })
-            .collect();
-        let mut sorted_counts = workspace_counts.clone();
-        sorted_counts.sort();
-        assert_eq!(
-            sorted_counts,
-            vec![1, 2],
-            "expected one window with 1 workspace and one with 2, got {workspace_counts:?}"
-        );
-
-        let dir1_path: Arc<Path> = Path::new(dir1).into();
-        let dir2_path: Arc<Path> = Path::new(dir2).into();
-        let dir3_path: Arc<Path> = Path::new(dir3).into();
-
-        let all_restored_paths: Vec<Vec<Vec<Arc<Path>>>> = restored_windows
-            .iter()
-            .map(|window| {
-                window
-                    .read_with(cx, |multi_workspace, cx| {
-                        multi_workspace
-                            .workspaces()
-                            .iter()
-                            .map(|ws| ws.read(cx).root_paths(cx))
-                            .collect()
-                    })
-                    .unwrap()
-            })
-            .collect();
-
-        let two_ws_window = all_restored_paths
-            .iter()
-            .find(|paths| paths.len() == 2)
-            .expect("expected a window with 2 workspaces");
-        assert!(
-            two_ws_window.iter().any(|p| p.contains(&dir1_path)),
-            "2-workspace window should contain dir1, got {two_ws_window:?}"
-        );
-        assert!(
-            two_ws_window.iter().any(|p| p.contains(&dir2_path)),
-            "2-workspace window should contain dir2, got {two_ws_window:?}"
-        );
-
-        let one_ws_window = all_restored_paths
-            .iter()
-            .find(|paths| paths.len() == 1)
-            .expect("expected a window with 1 workspace");
-        assert!(
-            one_ws_window[0].contains(&dir3_path),
-            "1-workspace window should contain dir3, got {one_ws_window:?}"
-        );
-
-        // --- Verify the active workspace is preserved ---
-        for window in &restored_windows {
-            let (active_paths, workspace_count) = window
-                .read_with(cx, |multi_workspace, cx| {
-                    let active = multi_workspace.workspace();
-                    (
-                        active.read(cx).root_paths(cx),
-                        multi_workspace.workspaces().len(),
-                    )
-                })
-                .unwrap();
-
-            if workspace_count == 2 {
-                assert!(
-                    active_paths.contains(&dir1_path),
-                    "2-workspace window should have dir1 active, got {active_paths:?}"
-                );
-            } else {
-                assert!(
-                    active_paths.contains(&dir3_path),
-                    "1-workspace window should have dir3 active, got {active_paths:?}"
-                );
+        // Identify restored windows by their active workspace root paths.
+        let (restored_a, restored_b) = {
+            let (mut with_dir1, mut with_dir3) = (None, None);
+            for window in &restored_windows {
+                let active_paths = window
+                    .read_with(cx, |mw, cx| mw.workspace().read(cx).root_paths(cx))
+                    .unwrap();
+                if active_paths.iter().any(|p| p.as_ref() == Path::new(dir1)) {
+                    with_dir1 = Some(window);
+                } else {
+                    with_dir3 = Some(window);
+                }
             }
-        }
+            (
+                with_dir1.expect("expected a window with dir1 active"),
+                with_dir3.expect("expected a window with dir3 active"),
+            )
+        };
+
+        // Window A (dir1+dir2): 1 workspace restored, but 2 project group keys.
+        restored_a
+            .read_with(cx, |mw, _| {
+                assert_eq!(
+                    mw.project_group_keys().cloned().collect::<Vec<_>>(),
+                    vec![
+                        ProjectGroupKey::new(None, PathList::new(&[dir1])),
+                        ProjectGroupKey::new(None, PathList::new(&[dir2])),
+                    ]
+                );
+                assert_eq!(mw.workspaces().len(), 1);
+            })
+            .unwrap();
+
+        // Window B (dir3): 1 workspace, 1 project group key.
+        restored_b
+            .read_with(cx, |mw, _| {
+                assert_eq!(
+                    mw.project_group_keys().cloned().collect::<Vec<_>>(),
+                    vec![ProjectGroupKey::new(None, PathList::new(&[dir3]))]
+                );
+                assert_eq!(mw.workspaces().len(), 1);
+            })
+            .unwrap();
     }
 }

@@ -15,9 +15,6 @@ members = [
     "crates/app_runtime_ui",
     "crates/askpass",
     "crates/assets",
-    "crates/assistant_text_thread",
-    "crates/assistant_slash_command",
-    "crates/assistant_slash_commands",
     "crates/audio",
     "crates/auto_update",
     "crates/auto_update_helper",
@@ -60,8 +57,9 @@ members = [
     "crates/edit_prediction_context",
     "crates/editor",
     "crates/encoding_selector",
+    "crates/env_var",
     "crates/etw_tracing",
-    "crates/eval",
+    "crates/eval_cli",
     "crates/eval_utils",
     "crates/explorer_command_injector",
     "crates/extension",
@@ -76,12 +74,15 @@ members = [
     "crates/fs",
     "crates/fs_benchmarks",
     "crates/fuzzy",
+    "crates/fuzzy_nucleo",
     "crates/git",
     "crates/git_graph",
     "crates/git_hosting_providers",
     "crates/git_ui",
     "crates/go_to_line",
     "crates/google_ai",
+    "crates/grammars",
+    "crates/gpui_shared_string",
     "crates/html_to_markdown",
     "crates/icons",
     "crates/image_viewer",
@@ -90,9 +91,12 @@ members = [
     "crates/json_schema_store",
     "crates/keymap_editor",
     "crates/language",
+    "crates/language_core",
     "crates/language_extension",
     "crates/language_model",
+    "crates/language_model_core",
     "crates/language_models",
+    "crates/language_models_cloud",
     "crates/language_onboarding",
     "crates/language_selector",
     "crates/language_tools",
@@ -117,6 +121,8 @@ members = [
     "crates/open_ai",
     "crates/open_path_prompt",
     "crates/open_router",
+    "crates/outline",
+    "crates/outline_panel",
     "crates/panel",
     "crates/paths",
     "crates/picker",
@@ -124,6 +130,7 @@ members = [
     "crates/project",
     "crates/project_benchmarks",
     "crates/project_panel",
+    "crates/project_symbols",
     "crates/prompt_store",
     "crates/proto",
     "crates/recent_projects",
@@ -158,6 +165,7 @@ members = [
     "crates/codestral",
     "crates/svg_preview",
     "crates/system_specs",
+    "crates/syntax_theme",
     "crates/tab_switcher",
     "crates/task",
     "crates/tasks_ui",
@@ -168,6 +176,7 @@ members = [
     "crates/text",
     "crates/theme",
     "crates/theme_extension",
+    "crates/theme_settings",
     "crates/theme_importer",
     "crates/theme_selector",
     "crates/time_format",
@@ -193,6 +202,7 @@ members = [
     "crates/x_ai",
     "crates/zed",
     "crates/zed_actions",
+    "crates/zed_credentials_provider",
     "crates/zed_env_vars",
     "crates/edit_prediction_cli",
     "crates/zeta_prompt",
@@ -208,13 +218,13 @@ members = [
     "extensions/glsl",
     "extensions/html",
     "extensions/proto",
-    "extensions/slash-commands-example",
     "extensions/test-extension",
 
     #
     # Tooling
     #
 
+    "tooling/compliance",
     "tooling/perf",
     "tooling/xtask",
 ]
@@ -261,9 +271,10 @@ clock = { path = "crates/clock" }
 cloud_api_client = { path = "crates/cloud_api_client" }
 cloud_api_types = { path = "crates/cloud_api_types" }
 cloud_llm_client = { path = "crates/cloud_llm_client" }
-collections = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19", version = "0.1.0" }
+collections = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a", version = "0.1.0" }
 command_palette = { path = "crates/command_palette" }
 command_palette_hooks = { path = "crates/command_palette_hooks" }
+compliance = { path = "tooling/compliance" }
 component = { path = "crates/component" }
 component_preview = { path = "crates/component_preview" }
 context_server = { path = "crates/context_server" }
@@ -281,11 +292,12 @@ debug_adapter_extension = { path = "crates/debug_adapter_extension" }
 debugger_tools = { path = "crates/debugger_tools" }
 debugger_ui = { path = "crates/debugger_ui" }
 deepseek = { path = "crates/deepseek" }
-derive_refineable = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
+derive_refineable = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
 dev_container = { path = "crates/dev_container" }
 diagnostics = { path = "crates/diagnostics" }
 editor = { path = "crates/editor" }
 encoding_selector = { path = "crates/encoding_selector" }
+env_var = { path = "crates/env_var" }
 etw_tracing = { path = "crates/etw_tracing" }
 eval_utils = { path = "crates/eval_utils" }
 extension = { path = "crates/extension" }
@@ -297,20 +309,23 @@ file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
+fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
 git = { path = "crates/git" }
 git_graph = { path = "crates/git_graph" }
 git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
 go_to_line = { path = "crates/go_to_line" }
 google_ai = { path = "crates/google_ai" }
-gpui = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19", default-features = false }
-gpui_macros = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
-gpui_platform = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19", default-features = false, features = ["font-kit"] }
-gpui_tokio = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
-gpui_util = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
+grammars = { path = "crates/grammars" }
+gpui = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a", default-features = false }
+gpui_shared_string = { path = "crates/gpui_shared_string" }
+gpui_macros = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
+gpui_platform = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a", default-features = false, features = ["font-kit"] }
+gpui_tokio = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
+gpui_util = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
 html_to_markdown = { path = "crates/html_to_markdown" }
-http_client = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
-http_client_tls = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
+http_client = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
+http_client_tls = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
 icons = { path = "crates/icons" }
 image_viewer = { path = "crates/image_viewer" }
 edit_prediction_types = { path = "crates/edit_prediction_types" }
@@ -321,9 +336,12 @@ install_cli = { path = "crates/install_cli" }
 json_schema_store = { path = "crates/json_schema_store" }
 keymap_editor = { path = "crates/keymap_editor" }
 language = { path = "crates/language" }
+language_core = { path = "crates/language_core" }
 language_extension = { path = "crates/language_extension" }
 language_model = { path = "crates/language_model" }
+language_model_core = { path = "crates/language_model_core" }
 language_models = { path = "crates/language_models" }
+language_models_cloud = { path = "crates/language_models_cloud" }
 language_onboarding = { path = "crates/language_onboarding" }
 language_selector = { path = "crates/language_selector" }
 language_tools = { path = "crates/language_tools" }
@@ -334,7 +352,7 @@ lsp = { path = "crates/lsp" }
 markdown = { path = "crates/markdown" }
 markdown_preview = { path = "crates/markdown_preview" }
 svg_preview = { path = "crates/svg_preview" }
-media = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
+media = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
 menu = { path = "crates/menu" }
 mermaid-rs-renderer = { git = "https://github.com/zed-industries/mermaid-rs-renderer", rev = "374db9ead5426697c6c2111151d9f246899bc638", default-features = false }
 migrator = { path = "crates/migrator" }
@@ -351,6 +369,8 @@ opencode = { path = "crates/opencode" }
 open_ai = { path = "crates/open_ai" }
 open_path_prompt = { path = "crates/open_path_prompt" }
 open_router = { path = "crates/open_router", features = ["schemars"] }
+outline = { path = "crates/outline" }
+outline_panel = { path = "crates/outline_panel" }
 panel = { path = "crates/panel" }
 paths = { path = "crates/paths" }
 perf = { path = "tooling/perf" }
@@ -359,10 +379,11 @@ prettier = { path = "crates/prettier" }
 settings_profile_selector = { path = "crates/settings_profile_selector" }
 project = { path = "crates/project" }
 project_panel = { path = "crates/project_panel" }
+project_symbols = { path = "crates/project_symbols" }
 prompt_store = { path = "crates/prompt_store" }
 proto = { path = "crates/proto" }
 recent_projects = { path = "crates/recent_projects" }
-refineable = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
+refineable = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
 release_channel = { path = "crates/release_channel" }
 remote = { path = "crates/remote" }
 remote_connection = { path = "crates/remote_connection" }
@@ -373,7 +394,7 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
 rope = { path = "crates/rope" }
 rpc = { path = "crates/rpc" }
 rules_library = { path = "crates/rules_library" }
-scheduler = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
+scheduler = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
 search = { path = "crates/search" }
 service_hub = { path = "crates/service_hub" }
 service_hub_ui = { path = "crates/service_hub_ui" }
@@ -391,9 +412,10 @@ snippets_ui = { path = "crates/snippets_ui" }
 sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
 streaming_diff = { path = "crates/streaming_diff" }
-sum_tree = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
+sum_tree = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
 codestral = { path = "crates/codestral" }
 system_specs = { path = "crates/system_specs" }
+syntax_theme = { path = "crates/syntax_theme" }
 tab_switcher = { path = "crates/tab_switcher" }
 task = { path = "crates/task" }
 tasks_ui = { path = "crates/tasks_ui" }
@@ -404,6 +426,7 @@ terminal_view = { path = "crates/terminal_view" }
 text = { path = "crates/text" }
 theme = { path = "crates/theme" }
 theme_extension = { path = "crates/theme_extension" }
+theme_settings = { path = "crates/theme_settings" }
 theme_selector = { path = "crates/theme_selector" }
 time_format = { path = "crates/time_format" }
 toast = { path = "crates/toast" }
@@ -414,7 +437,7 @@ ui = { path = "crates/ui" }
 ui_input = { path = "crates/ui_input" }
 ui_macros = { path = "crates/ui_macros" }
 ui_prompt = { path = "crates/ui_prompt" }
-util = { git = "https://github.com/Glass-HQ/gpui.git", rev = "c7a68d19" }
+util = { git = "https://github.com/Glass-HQ/gpui.git", rev = "5b0f298a" }
 util_macros = { path = "crates/util_macros" }
 vercel = { path = "crates/vercel" }
 which_key = { path = "crates/which_key" }
@@ -429,6 +452,7 @@ worktree = { path = "crates/worktree" }
 x_ai = { path = "crates/x_ai" }
 zed = { path = "crates/zed" }
 zed_actions = { path = "crates/zed_actions" }
+zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 edit_prediction = { path = "crates/edit_prediction" }
 zeta_prompt = { path = "crates/zeta_prompt" }
@@ -455,7 +479,7 @@ ashpd = { version = "0.13", default-features = false, features = [
     "trash"
 ] }
 async-compat = "0.2.1"
-async-compression = { version = "0.4", features = ["gzip", "futures-io"] }
+async-compression = { version = "0.4", features = ["bzip2", "gzip", "futures-io"] }
 async-dispatcher = "0.1"
 async-fs = "2.1"
 async-lock = "2.1"
@@ -507,6 +531,7 @@ derive_more = { version = "2.1.1", features = [
     "add_assign",
     "deref",
     "deref_mut",
+    "display",
     "from_str",
     "mul",
     "mul_assign",
@@ -553,7 +578,7 @@ libc = "0.2"
 libsqlite3-sys = { version = "0.30.1", features = ["bundled"] }
 linkify = "0.10.0"
 log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
-lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "a4f410987660bf560d1e617cb78117c6b6b9f599" }
+lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "c7396459fefc7886b4adfa3b596832405ae1e880" }
 mach2 = "0.5"
 markup5ever_rcdom = "0.3.0"
 metal = "0.33"
@@ -563,6 +588,7 @@ naga = { version = "29.0", features = ["wgsl-in"] }
 nanoid = "0.4"
 nbformat = "1.2.0"
 nix = "0.29"
+nucleo = "0.5"
 num-format = "0.4.4"
 objc = "0.2"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
@@ -636,7 +662,7 @@ rsa = "0.9.6"
 runtimelib = { version = "1.4.0", default-features = false, features = [
     "async-dispatcher-runtime", "aws-lc-rs"
 ] }
-rust-embed = { version = "8.4", features = ["include-exclude"] }
+rust-embed = { version = "8.11", features = ["include-exclude"] }
 rustc-hash = "2.1.0"
 rustls = { version = "0.23.26" }
 rustls-platform-verifier = "0.5.0"
@@ -712,7 +738,7 @@ tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-ma
 tree-sitter-python = "0.25"
 tree-sitter-regex = "0.24"
 tree-sitter-ruby = "0.23"
-tree-sitter-rust = "0.24.1"
+tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = { git = "https://github.com/zed-industries/tree-sitter-typescript", rev = "e2c53597d6a5d9cf7bbe8dccde576fe1e46c5899" } # https://github.com/tree-sitter/tree-sitter-typescript/pull/347
 tree-sitter-yaml = { git = "https://github.com/zed-industries/tree-sitter-yaml", rev = "baff0b51c64ef6a1fb1f8390f3ad6015b83ec13a" }
 tracing = "0.1.40"
@@ -750,6 +776,8 @@ zstd = "0.11"
 [workspace.dependencies.windows]
 version = "0.61"
 features = [
+    "Globalization",
+    "Globalization_DateTimeFormatting",
     "Foundation_Numerics",
     "Storage_Search",
     "Storage_Streams",
@@ -762,6 +790,7 @@ features = [
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_DirectComposition",
     "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_DirectManipulation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
@@ -793,6 +822,7 @@ features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_Shell_PropertiesSystem",
@@ -832,9 +862,13 @@ syn = { opt-level = 3 }
 proc-macro2 = { opt-level = 3 }
 # proc-macros end
 
+tree-sitter = { opt-level = 3 }
 taffy = { opt-level = 3 }
 resvg = { opt-level = 3 }
 wasmtime = { opt-level = 3 }
+cranelift-codegen = { opt-level = 3 }
+wasmtime-environ = { opt-level = 3 }
+wasmtime-internal-cranelift = { opt-level = 3 }
 # Build single-source-file crates with cg=1 as it helps make `cargo build` of a whole workspace a bit faster
 activity_indicator = { codegen-units = 1 }
 assets = { codegen-units = 1 }

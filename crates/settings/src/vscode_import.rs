@@ -190,13 +190,16 @@ impl VsCodeSettings {
                 semantic_token_rules: self.semantic_token_rules(),
                 ..GlobalLspSettingsContent::default()
             }),
+            helix_mode: None,
             image_viewer: None,
+            journal: None,
             language_models: None,
             line_indicator_format: None,
             log: None,
             message_editor: None,
             node: self.node_binary_settings(),
-            notification_panel: None,
+
+            outline_panel: self.outline_panel_settings_content(),
             preview_tabs: self.preview_tabs_settings_content(),
             project: self.project_settings_content(),
             project_panel: self.project_panel_settings_content(),
@@ -205,14 +208,18 @@ impl VsCodeSettings {
             repl: None,
             server_url: None,
             session: None,
+            status_bar: None,
             tab_bar: self.tab_bar_settings_content(),
             tabs: self.item_settings_content(),
             telemetry: self.telemetry_settings_content(),
             terminal: self.terminal_settings_content(),
             theme: Box::new(self.theme_settings_content()),
             title_bar: None,
+            vim: None,
+            vim_mode: None,
             workspace: self.workspace_settings_content(),
             which_key: None,
+            modeline_lines: None,
         }
     }
 
@@ -301,6 +308,7 @@ impl VsCodeSettings {
             completion_menu_scrollbar: None,
             completion_detail_alignment: None,
             diff_view_style: None,
+            minimum_split_diff_width: None,
         }
     }
 
@@ -501,7 +509,6 @@ impl VsCodeSettings {
             context_servers: self.context_servers(),
             context_server_timeout: None,
             load_direnv: None,
-            slash_commands: None,
             git_hosting_providers: None,
             disable_ai: None,
         }
@@ -647,6 +654,15 @@ impl VsCodeSettings {
         })
     }
 
+    fn outline_panel_settings_content(&self) -> Option<OutlinePanelSettingsContent> {
+        skip_default(OutlinePanelSettingsContent {
+            file_icons: self.read_bool("outline.icons"),
+            folder_icons: self.read_bool("outline.icons"),
+            git_status: self.read_bool("git.decorations.enabled"),
+            ..Default::default()
+        })
+    }
+
     fn git_settings_content(&self) -> Option<GitSettings> {
         let inline_blame = self.read_bool("git.blame.editorDecoration.enabled")?;
         skip_default(GitSettings {
@@ -777,11 +793,24 @@ impl VsCodeSettings {
             show_diagnostics: self
                 .read_bool("problems.decorations.enabled")
                 .and_then(|b| if b { Some(ShowDiagnostics::Off) } else { None }),
-            sort_mode: None,
+            sort_mode: self.read_enum("explorer.sortOrder", |s| match s {
+                "default" | "foldersNestsFiles" => Some(ProjectPanelSortMode::DirectoriesFirst),
+                "mixed" => Some(ProjectPanelSortMode::Mixed),
+                "filesFirst" => Some(ProjectPanelSortMode::FilesFirst),
+                _ => None,
+            }),
+            sort_order: self.read_enum("explorer.sortOrderLexicographicOptions", |s| match s {
+                "default" => Some(ProjectPanelSortOrder::Default),
+                "upper" => Some(ProjectPanelSortOrder::Upper),
+                "lower" => Some(ProjectPanelSortOrder::Lower),
+                "unicode" => Some(ProjectPanelSortOrder::Unicode),
+                _ => None,
+            }),
             starts_open: None,
             sticky_scroll: None,
             auto_open: None,
             diagnostic_badges: None,
+            git_status_indicator: None,
         };
 
         if let (Some(false), Some(false)) = (
@@ -853,6 +882,7 @@ impl VsCodeSettings {
             scroll_multiplier: None,
             toolbar: None,
             show_count_badge: None,
+            flexible: None,
         })
     }
 
@@ -970,6 +1000,7 @@ impl VsCodeSettings {
                 }
             }),
             zoomed_padding: None,
+            focus_follows_mouse: None,
         }
     }
 

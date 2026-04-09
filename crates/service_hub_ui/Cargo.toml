@@ -12,13 +12,17 @@ path = "src/service_hub_ui.rs"
 workspace = true
 
 [dependencies]
+app_runtime.workspace = true
 anyhow.workspace = true
+db.workspace = true
+futures.workspace = true
 gpui.workspace = true
 project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 service_hub.workspace = true
 task.workspace = true
+theme.workspace = true
 ui.workspace = true
 ui_input.workspace = true
 util.workspace = true

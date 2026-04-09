@@ -11,11 +11,12 @@ use dev_container::{
 };
 use editor::Editor;
 
+use extension_host::ExtensionStore;
 use futures::{FutureExt, channel::oneshot, future::Shared};
 use gpui::{
     Action, AnyElement, App, ClickEvent, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, FocusHandle, Focusable, PromptLevel, ScrollHandle, Subscription, Task,
-    WeakEntity, Window, canvas, native_icon_button,
+    WeakEntity, Window, canvas,
 };
 use log::{debug, info};
 use open_path_prompt::OpenPathDelegate;
@@ -41,9 +42,11 @@ use std::{
         atomic::{self, AtomicUsize},
     },
 };
+
 use ui::{
-    CommonAnimationExt, KeyBinding, List, ListItem, ListSeparator, Modal, ModalFooter, ModalHeader,
-    Navigable, NavigableEntry, Section, Tooltip, WithScrollbar, prelude::*,
+    CommonAnimationExt, IconButtonShape, KeyBinding, List, ListItem, ListSeparator, Modal,
+    ModalFooter, ModalHeader, Navigable, NavigableEntry, Section, Tooltip, WithScrollbar,
+    prelude::*,
 };
 use util::{
     ResultExt,
@@ -51,7 +54,7 @@ use util::{
     rel_path::RelPath,
 };
 use workspace::{
-    AppState, ModalView, MultiWorkspace, OpenLog, OpenOptions, Toast, Workspace,
+    AppState, DismissDecision, ModalView, MultiWorkspace, OpenLog, OpenOptions, Toast, Workspace,
     notifications::{DetachAndPromptErr, NotificationId},
     open_remote_project_with_existing_connection,
 };
@@ -66,6 +69,7 @@ pub struct RemoteServerProjects {
     create_new_window: bool,
     dev_container_picker: Option<Entity<Picker<DevContainerPickerDelegate>>>,
     _subscription: Subscription,
+    allow_dismissal: bool,
 }
 
 struct CreateRemoteServer {
@@ -917,6 +921,7 @@ impl RemoteServerProjects {
             create_new_window,
             dev_container_picker: None,
             _subscription,
+            allow_dismissal: true,
         }
     }
 
@@ -1137,6 +1142,7 @@ impl RemoteServerProjects {
     }
 
     fn view_in_progress_dev_container(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.allow_dismissal = false;
         self.mode = Mode::CreateRemoteDevContainer(CreateRemoteDevContainer::new(
             DevContainerCreationProgress::Creating,
             cx,
@@ -1306,6 +1312,7 @@ impl RemoteServerProjects {
                 cx.emit(DismissEvent);
             }
             _ => {
+                self.allow_dismissal = true;
                 self.mode = Mode::default_mode(&self.ssh_config_servers, cx);
                 self.focus_handle(cx).focus(window, cx);
                 cx.notify();
@@ -1565,7 +1572,7 @@ impl RemoteServerProjects {
                         project.paths.into_iter().map(PathBuf::from).collect(),
                         app_state,
                         OpenOptions {
-                            replace_window,
+                            requesting_window: replace_window,
                             ..OpenOptions::default()
                         },
                         cx,
@@ -1620,20 +1627,24 @@ impl RemoteServerProjects {
                     }))
                     .tooltip(Tooltip::text(project.paths.join("\n")))
                     .when(is_from_zed, |server_list_item| {
-                        server_list_item.end_hover_slot::<AnyElement>(Some(
-                            div()
-                                .mr_2()
-                                .child({
-                                    let project = project.clone();
-                                    // Right-margin to offset it from the Scrollbar
-                                    native_icon_button("remove-remote-project", "trash")
-                                        .tooltip("Delete Remote Project")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.delete_remote_project(server_ix, &project, cx)
-                                        }))
-                                })
-                                .into_any_element(),
-                        ))
+                        server_list_item
+                            .end_slot(
+                                div()
+                                    .mr_2()
+                                    .child({
+                                        let project = project.clone();
+                                        IconButton::new("remove-remote-project", IconName::Trash)
+                                            .icon_size(IconSize::Small)
+                                            .shape(IconButtonShape::Square)
+                                            .size(ButtonSize::Large)
+                                            .tooltip(Tooltip::text("Delete Remote Project"))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.delete_remote_project(server_ix, &project, cx)
+                                            }))
+                                    })
+                                    .into_any_element(),
+                            )
+                            .show_end_slot_on_hover()
                     }),
             )
     }
@@ -1848,12 +1859,12 @@ impl RemoteServerProjects {
         cx: &mut Context<Self>,
     ) {
         let replace_window = window.window_handle().downcast::<MultiWorkspace>();
-
         let app_state = Arc::downgrade(&app_state);
+
         cx.spawn_in(window, async move |entity, cx| {
-            let (connection, starting_dir) =
+            let (dev_container_connection, starting_dir) =
                 match start_dev_container_with_config(context, config).await {
-                    Ok((c, s)) => (Connection::DevContainer(c), s),
+                    Ok((c, s)) => (c, s),
                     Err(e) => {
                         log::error!("Failed to start dev container: {:?}", e);
                         cx.prompt(
@@ -1866,6 +1877,7 @@ impl RemoteServerProjects {
                         .ok();
                         entity
                             .update_in(cx, |remote_server_projects, window, cx| {
+                                remote_server_projects.allow_dismissal = true;
                                 remote_server_projects.mode =
                                     Mode::CreateRemoteDevContainer(CreateRemoteDevContainer::new(
                                         DevContainerCreationProgress::Error(format!("{e}")),
@@ -1877,8 +1889,19 @@ impl RemoteServerProjects {
                         return;
                     }
                 };
+            cx.update(|_, cx| {
+                ExtensionStore::global(cx).update(cx, |this, cx| {
+                    for extension in &dev_container_connection.extension_ids {
+                        log::info!("Installing extension {extension} from devcontainer");
+                        this.install_latest_extension(Arc::from(extension.clone()), cx);
+                    }
+                })
+            })
+            .log_err();
+
             entity
-                .update(cx, |_, cx| {
+                .update(cx, |this, cx| {
+                    this.allow_dismissal = true;
                     cx.emit(DismissEvent);
                 })
                 .log_err();
@@ -1887,11 +1910,11 @@ impl RemoteServerProjects {
                 return;
             };
             let result = open_remote_project(
-                connection.into(),
+                Connection::DevContainer(dev_container_connection).into(),
                 vec![starting_dir].into_iter().map(PathBuf::from).collect(),
                 app_state,
                 OpenOptions {
-                    replace_window,
+                    requesting_window: replace_window,
                     ..OpenOptions::default()
                 },
                 cx,
@@ -2410,9 +2433,8 @@ impl RemoteServerProjects {
                             .spacing(ui::ListItemSpacing::Sparse)
                             .start_slot(Icon::new(IconName::Copy).color(Color::Muted))
                             .child(Label::new("Copy Server Address"))
-                            .end_hover_slot(
-                                Label::new(connection_string.clone()).color(Color::Muted),
-                            )
+                            .end_slot(Label::new(connection_string.clone()).color(Color::Muted))
+                            .show_end_slot_on_hover()
                             .on_click({
                                 let connection_string = connection_string.clone();
                                 move |_, _, cx| {
@@ -2930,7 +2952,15 @@ fn get_text(element: &Entity<Editor>, cx: &mut App) -> String {
     element.read(cx).text(cx).trim().to_string()
 }
 
-impl ModalView for RemoteServerProjects {}
+impl ModalView for RemoteServerProjects {
+    fn on_before_dismiss(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> DismissDecision {
+        DismissDecision::Dismiss(self.allow_dismissal)
+    }
+}
 
 impl Focusable for RemoteServerProjects {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

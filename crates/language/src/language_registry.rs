@@ -5,6 +5,10 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, HashMap, HashSet, hash_map};
+pub use language_core::{
+    BinaryStatus, LanguageName, LanguageQueries, LanguageServerStatusUpdate,
+    QUERY_FILENAME_PREFIXES, ServerHealth,
+};
 use settings::{AllLanguageSettingsContent, LanguageSettingsContent};
 
 use futures::{
@@ -12,15 +16,13 @@ use futures::{
     channel::{mpsc, oneshot},
 };
 use globset::GlobSet;
-use gpui::{App, BackgroundExecutor, SharedString};
+use gpui::{App, BackgroundExecutor};
 use lsp::LanguageServerId;
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+
 use smallvec::SmallVec;
 use std::{
-    borrow::{Borrow, Cow},
     cell::LazyCell,
     ffi::OsStr,
     ops::Not,
@@ -32,91 +34,6 @@ use text::{Point, Rope};
 use theme::Theme;
 use unicase::UniCase;
 use util::{ResultExt, maybe, post_inc};
-
-#[derive(
-    Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
-pub struct LanguageName(pub SharedString);
-
-impl LanguageName {
-    pub fn new(s: &str) -> Self {
-        Self(SharedString::new(s))
-    }
-
-    pub fn new_static(s: &'static str) -> Self {
-        Self(SharedString::new_static(s))
-    }
-
-    pub fn from_proto(s: String) -> Self {
-        Self(SharedString::from(s))
-    }
-
-    pub fn to_proto(&self) -> String {
-        self.0.to_string()
-    }
-
-    pub fn lsp_id(&self) -> String {
-        match self.0.as_ref() {
-            "Plain Text" => "plaintext".to_string(),
-            language_name => language_name.to_lowercase(),
-        }
-    }
-}
-
-impl From<LanguageName> for SharedString {
-    fn from(value: LanguageName) -> Self {
-        value.0
-    }
-}
-
-impl From<SharedString> for LanguageName {
-    fn from(value: SharedString) -> Self {
-        LanguageName(value)
-    }
-}
-
-impl AsRef<str> for LanguageName {
-    fn as_ref(&self) -> &str {
-        self.0.as_ref()
-    }
-}
-
-impl Borrow<str> for LanguageName {
-    fn borrow(&self) -> &str {
-        self.0.as_ref()
-    }
-}
-
-impl PartialEq<str> for LanguageName {
-    fn eq(&self, other: &str) -> bool {
-        self.0.as_ref() == other
-    }
-}
-
-impl PartialEq<&str> for LanguageName {
-    fn eq(&self, other: &&str) -> bool {
-        self.0.as_ref() == *other
-    }
-}
-
-impl std::fmt::Display for LanguageName {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<&'static str> for LanguageName {
-    fn from(str: &'static str) -> Self {
-        Self(SharedString::new_static(str))
-    }
-}
-
-impl From<LanguageName> for String {
-    fn from(value: LanguageName) -> Self {
-        let value: &str = &value.0;
-        Self::from(value)
-    }
-}
 
 pub struct LanguageRegistry {
     state: RwLock<LanguageRegistryState>,
@@ -151,31 +68,6 @@ pub struct FakeLanguageServerEntry {
     pub initializer: Option<Box<dyn 'static + Send + Sync + Fn(&mut lsp::FakeLanguageServer)>>,
     pub tx: futures::channel::mpsc::UnboundedSender<lsp::FakeLanguageServer>,
     pub _server: Option<lsp::FakeLanguageServer>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LanguageServerStatusUpdate {
-    Binary(BinaryStatus),
-    Health(ServerHealth, Option<SharedString>),
-}
-
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone, Copy)]
-#[serde(rename_all = "camelCase")]
-pub enum ServerHealth {
-    Ok,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BinaryStatus {
-    None,
-    CheckingForUpdate,
-    Downloading,
-    Starting,
-    Stopping,
-    Stopped,
-    Failed { error: String },
 }
 
 #[derive(Clone)]
@@ -230,39 +122,6 @@ impl std::fmt::Display for LanguageNotFound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "language not found")
     }
-}
-
-pub const QUERY_FILENAME_PREFIXES: &[(
-    &str,
-    fn(&mut LanguageQueries) -> &mut Option<Cow<'static, str>>,
-)] = &[
-    ("highlights", |q| &mut q.highlights),
-    ("brackets", |q| &mut q.brackets),
-    ("outline", |q| &mut q.outline),
-    ("indents", |q| &mut q.indents),
-    ("injections", |q| &mut q.injections),
-    ("overrides", |q| &mut q.overrides),
-    ("redactions", |q| &mut q.redactions),
-    ("runnables", |q| &mut q.runnables),
-    ("debugger", |q| &mut q.debugger),
-    ("textobjects", |q| &mut q.text_objects),
-    ("imports", |q| &mut q.imports),
-];
-
-/// Tree-sitter language queries for a given language.
-#[derive(Debug, Default)]
-pub struct LanguageQueries {
-    pub highlights: Option<Cow<'static, str>>,
-    pub brackets: Option<Cow<'static, str>>,
-    pub indents: Option<Cow<'static, str>>,
-    pub outline: Option<Cow<'static, str>>,
-    pub injections: Option<Cow<'static, str>>,
-    pub overrides: Option<Cow<'static, str>>,
-    pub redactions: Option<Cow<'static, str>>,
-    pub runnables: Option<Cow<'static, str>>,
-    pub text_objects: Option<Cow<'static, str>>,
-    pub debugger: Option<Cow<'static, str>>,
-    pub imports: Option<Cow<'static, str>>,
 }
 
 #[derive(Clone, Default)]
@@ -745,6 +604,44 @@ impl LanguageRegistry {
             .cloned()
     }
 
+    /// Look up a language by its modeline name (vim filetype or emacs mode).
+    ///
+    /// This performs a case-insensitive match against:
+    /// 1. Explicit modeline aliases defined in the language config
+    /// 2. The language's grammar name
+    /// 3. The language name itself
+    pub fn available_language_for_modeline_name(
+        self: &Arc<Self>,
+        modeline_name: &str,
+    ) -> Option<AvailableLanguage> {
+        let modeline_name_lower = modeline_name.to_lowercase();
+        let state = self.state.read();
+
+        state
+            .available_languages
+            .iter()
+            .find(|lang| {
+                lang.matcher
+                    .modeline_aliases
+                    .iter()
+                    .any(|alias| alias.to_lowercase() == modeline_name_lower)
+            })
+            .or_else(|| {
+                state.available_languages.iter().find(|lang| {
+                    lang.grammar
+                        .as_ref()
+                        .is_some_and(|g| g.to_lowercase() == modeline_name_lower)
+                })
+            })
+            .or_else(|| {
+                state
+                    .available_languages
+                    .iter()
+                    .find(|lang| lang.name.0.to_lowercase() == modeline_name_lower)
+            })
+            .cloned()
+    }
+
     pub fn language_for_file(
         self: &Arc<Self>,
         file: &Arc<dyn File>,
@@ -1077,9 +974,14 @@ impl LanguageRegistry {
                     log::trace!("start loading grammar {name:?}");
                     let this = self.clone();
                     let wasm_path = wasm_path.clone();
+                    let thread_name_suffix = name.clone();
+                    let grammar_name = name.clone();
                     *grammar = AvailableGrammar::Loading(wasm_path.clone(), vec![tx]);
-                    self.executor
-                        .spawn(async move {
+                    let thread_name = format!("grammar-load-{thread_name_suffix}");
+                    let spawn_result = std::thread::Builder::new()
+                        .name(thread_name)
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
                             let grammar_result = maybe!({
                                 let wasm_bytes = std::fs::read(&wasm_path)?;
                                 let grammar_name = wasm_path
@@ -1087,7 +989,9 @@ impl LanguageRegistry {
                                     .and_then(OsStr::to_str)
                                     .context("invalid grammar filename")?;
                                 anyhow::Ok(with_parser(|parser| {
-                                    let mut store = parser.take_wasm_store().unwrap();
+                                    let mut store = parser.take_wasm_store().unwrap_or_else(|| {
+                                        tree_sitter::WasmStore::new(&crate::WASM_ENGINE).unwrap()
+                                    });
                                     let grammar = store.load_language(grammar_name, &wasm_bytes);
                                     parser.set_wasm_store(store).unwrap();
                                     grammar
@@ -1100,15 +1004,29 @@ impl LanguageRegistry {
                                 Err(error) => AvailableGrammar::LoadFailed(error.clone()),
                             };
 
-                            log::trace!("finish loading grammar {name:?}");
-                            let old_value = this.state.write().grammars.insert(name, value);
+                            log::trace!("finish loading grammar {grammar_name:?}");
+                            let old_value = this.state.write().grammars.insert(grammar_name, value);
                             if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
                                 for tx in txs {
                                     tx.send(grammar_result.clone()).ok();
                                 }
                             }
-                        })
-                        .detach();
+                        });
+
+                    if let Err(error) = spawn_result {
+                        let error =
+                            Arc::new(anyhow!("failed to spawn grammar loader thread: {error}"));
+                        let old_value = self
+                            .state
+                            .write()
+                            .grammars
+                            .insert(name, AvailableGrammar::LoadFailed(error.clone()));
+                        if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
+                            for tx in txs {
+                                tx.send(Err(error.clone())).ok();
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -1223,7 +1141,7 @@ impl LanguageRegistryState {
             LanguageSettingsContent {
                 tab_size: language.config.tab_size,
                 hard_tabs: language.config.hard_tabs,
-                soft_wrap: language.config.soft_wrap,
+                soft_wrap: language.config.soft_wrap.map(crate::to_settings_soft_wrap),
                 auto_indent_on_paste: language.config.auto_indent_on_paste,
                 ..Default::default()
             },

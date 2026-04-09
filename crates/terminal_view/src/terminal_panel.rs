@@ -81,8 +81,6 @@ pub struct TerminalPanel {
     project: Entity<Project>,
     database_id: Option<WorkspaceId>,
     serialization_key: Option<String>,
-    pub(crate) width: Option<Pixels>,
-    pub(crate) height: Option<Pixels>,
     pending_serialization: Task<Option<()>>,
     pending_terminals_to_add: usize,
     deferred_tasks: HashMap<TaskId, Task<()>>,
@@ -116,8 +114,6 @@ impl TerminalPanel {
             database_id: workspace.database_id(),
             serialization_key: TerminalPanel::serialization_key(workspace),
             pending_serialization: Task::ready(None),
-            width: None,
-            height: None,
             pending_terminals_to_add: 0,
             deferred_tasks: HashMap::default(),
             assistant_enabled: false,
@@ -333,6 +329,7 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) {
         let assistant_tab_bar_button = self.assistant_tab_bar_button.clone();
+        let workspace = self.workspace.clone();
         terminal_pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
                 let split_context = pane
@@ -364,6 +361,15 @@ impl TerminalPanel {
                             cx,
                         )
                     });
+                let browser_surface_button = workspace.upgrade().map(|workspace| {
+                    tab_row_icon_button("show_browser_surface", IconName::Globe)
+                        .tooltip(Tooltip::text("Show Browser"))
+                        .on_click(move |_, window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.show_browser_surface(true, window, cx).log_err();
+                            });
+                        })
+                });
 
                 let right_children: Option<AnyElement> = tab_row_button_group(cx)
                     .child(
@@ -392,6 +398,9 @@ impl TerminalPanel {
                                 Some(menu)
                             }),
                     )
+                    .when_some(browser_surface_button, |buttons, button| {
+                        buttons.child(button)
+                    })
                     .children(assistant_tab_bar_button.clone())
                     .child(
                         PopoverMenu::new("terminal-pane-tab-bar-split")
@@ -1142,8 +1151,6 @@ impl TerminalPanel {
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
-        let height = self.height;
-        let width = self.width;
         let Some(serialization_key) = self.serialization_key.clone() else {
             return;
         };
@@ -1168,8 +1175,6 @@ impl TerminalPanel {
                         serde_json::to_string(&SerializedTerminalPanel {
                             items,
                             active_item_id: None,
-                            height,
-                            width,
                         })?,
                     )
                     .await?;
@@ -1767,25 +1772,26 @@ impl Panel for TerminalPanel {
         });
     }
 
-    fn size(&self, window: &Window, cx: &App) -> Pixels {
+    fn default_size(&self, window: &Window, cx: &App) -> Pixels {
         let settings = TerminalSettings::get_global(cx);
         match self.position(window, cx) {
-            DockPosition::Left | DockPosition::Right => {
-                self.width.unwrap_or(settings.default_width)
-            }
-            DockPosition::Bottom => self.height.unwrap_or(settings.default_height),
+            DockPosition::Left | DockPosition::Right => settings.default_width,
+            DockPosition::Bottom => settings.default_height,
         }
     }
 
-    fn set_size(&mut self, size: Option<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        match self.position(window, cx) {
-            DockPosition::Left | DockPosition::Right => self.width = size,
-            DockPosition::Bottom => self.height = size,
-        }
-        cx.notify();
-        cx.defer_in(window, |this, _, cx| {
-            this.serialize(cx);
-        })
+    fn supports_flexible_size(&self) -> bool {
+        true
+    }
+
+    fn has_flexible_size(&self, _window: &Window, cx: &App) -> bool {
+        TerminalSettings::get_global(cx).flexible
+    }
+
+    fn set_flexible_size(&mut self, flexible: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            settings.terminal.get_or_insert_default().flexible = Some(flexible);
+        });
     }
 
     fn is_zoomed(&self, _window: &Window, cx: &App) -> bool {
@@ -1893,7 +1899,7 @@ impl Panel for TerminalPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        1
+        2
     }
 }
 
@@ -2292,7 +2298,7 @@ mod tests {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
-            theme::init(theme::LoadThemes::JustBase, cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             crate::init(cx);
         });

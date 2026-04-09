@@ -36,6 +36,7 @@ pub struct OpenRequest {
     pub open_paths: Vec<String>,
     pub diff_paths: Vec<[String; 2]>,
     pub diff_all: bool,
+    pub dev_container: bool,
     pub remote_connection: Option<RemoteConnectionOptions>,
 }
 
@@ -405,6 +406,7 @@ pub async fn handle_cli_connection(
                 open_new_workspace,
                 reuse,
                 env,
+                dev_container: _,
                 user_data_dir: _,
             } => {
                 if !urls.is_empty() {
@@ -522,7 +524,7 @@ async fn open_workspaces(
         };
         let open_options = workspace::OpenOptions {
             open_new_workspace,
-            replace_window,
+            requesting_window: replace_window,
             wait,
             env: env.clone(),
             ..Default::default()
@@ -1028,7 +1030,7 @@ mod tests {
             })
             .unwrap();
 
-        // Now open a file inside that workspace, but tell Zed to open a new window
+        // Opening a file inside the existing worktree with -n reuses the window.
         open_workspace_file(
             path!("/root/dir1/file1.txt"),
             Some(true),
@@ -1037,18 +1039,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(cx.windows().len(), 2);
-
-        let multi_workspace_2 = cx.windows()[1].downcast::<MultiWorkspace>().unwrap();
-        multi_workspace_2
-            .update(cx, |multi_workspace, _, cx| {
-                multi_workspace.workspace().update(cx, |workspace, cx| {
-                    assert!(workspace.active_item_as::<Editor>(cx).is_some());
-                    let items = workspace.items(cx).collect::<Vec<_>>();
-                    assert_eq!(items.len(), 1, "Workspace should have two items");
-                });
-            })
-            .unwrap();
+        assert_eq!(cx.windows().len(), 1);
     }
 
     #[gpui::test]
@@ -1285,7 +1276,7 @@ mod tests {
                         vec![],
                         false,
                         workspace::OpenOptions {
-                            replace_window: Some(window_to_replace),
+                            requesting_window: Some(window_to_replace),
                             ..Default::default()
                         },
                         &response_tx,

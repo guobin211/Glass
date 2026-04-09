@@ -2,11 +2,11 @@ pub mod project_panel_settings;
 mod undo;
 mod utils;
 
+use crate::project_panel_settings::ProjectPanelScrollbarProxy;
 use anyhow::{Context as _, Result};
 use client::{ErrorCode, ErrorExt};
 use collections::{BTreeSet, HashMap, hash_map};
 use command_palette_hooks::CommandPaletteFilter;
-use db::kvp::KeyValueStore;
 use editor::{
     Editor, EditorEvent, MultiBufferOffset,
     items::{
@@ -41,7 +41,7 @@ use project::{
 use project_panel_settings::ProjectPanelSettings;
 use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use settings::{
     DockSide, Settings, SettingsStore, ShowDiagnostics, ShowIndentGuides, update_settings_file,
 };
@@ -57,13 +57,13 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use theme::ThemeSettings;
+use theme_settings::ThemeSettings;
 use toast::{StatusToast, ToastIcon};
 use ui::{
     Color, ContextMenu, ContextMenuEntry, DecoratedIcon, Divider, Icon, IconDecoration,
-    IconDecorationKind, IndentGuideColors, IndentGuideLayout, KeyBinding, Label, LabelSize,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
-    v_flex,
+    IconDecorationKind, IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, Label,
+    LabelSize, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar,
+    prelude::*, v_flex,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt, maybe,
@@ -132,6 +132,7 @@ impl State {
 pub struct ProjectPanel {
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
+    embedded: bool,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     // An update loop that keeps incrementing/decrementing scroll offset while there is a dragged entry that's
@@ -147,8 +148,6 @@ pub struct ProjectPanel {
     clipboard: Option<ClipboardEntry>,
     _dragged_entry_destination: Option<Arc<Path>>,
     workspace: WeakEntity<Workspace>,
-    width: Option<Pixels>,
-    pending_serialization: Task<Option<()>>,
     diagnostics: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticSeverity>,
     diagnostic_counts: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticCount>,
     diagnostic_summary_update: Task<()>,
@@ -607,11 +606,6 @@ pub enum Event {
     Focus,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SerializedProjectPanel {
-    width: Option<Pixels>,
-}
-
 struct DraggedProjectEntryView {
     selection: SelectedEntry,
     icon: Option<SharedString>,
@@ -870,6 +864,9 @@ impl ProjectPanel {
                     if project_panel_settings.sort_mode != new_settings.sort_mode {
                         this.update_visible_entries(None, false, false, window, cx);
                     }
+                    if project_panel_settings.sort_order != new_settings.sort_order {
+                        this.update_visible_entries(None, false, false, window, cx);
+                    }
                     if project_panel_settings.sticky_scroll && !new_settings.sticky_scroll {
                         this.sticky_items_count = 0;
                     }
@@ -885,6 +882,7 @@ impl ProjectPanel {
                 project: project.clone(),
                 hover_scroll_task: None,
                 fs: workspace.app_state().fs.clone(),
+                embedded: false,
                 focus_handle,
                 rendered_entries_len: 0,
                 folded_directory_drag_target: None,
@@ -896,8 +894,6 @@ impl ProjectPanel {
                 clipboard: None,
                 _dragged_entry_destination: None,
                 workspace: workspace.weak_handle(),
-                width: None,
-                pending_serialization: Task::ready(None),
                 diagnostics: Default::default(),
                 diagnostic_counts: Default::default(),
                 diagnostic_summary_update: Task::ready(()),
@@ -1014,41 +1010,24 @@ impl ProjectPanel {
         project_panel
     }
 
+    pub fn new_embedded(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        let panel = Self::new(workspace, window, cx);
+        panel.update(cx, |this, _cx| {
+            this.embedded = true;
+        });
+        panel
+    }
+
     pub async fn load(
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
-        let serialized_panel = match workspace
-            .read_with(&cx, |workspace, _| {
-                ProjectPanel::serialization_key(workspace)
-            })
-            .ok()
-            .flatten()
-        {
-            Some(serialization_key) => {
-                let kvp = cx.update(|_, cx| KeyValueStore::global(cx))?;
-                cx.background_spawn(async move { kvp.read_kvp(&serialization_key) })
-                    .await
-                    .context("loading project panel")
-                    .log_err()
-                    .flatten()
-                    .map(|panel| serde_json::from_str::<SerializedProjectPanel>(&panel))
-                    .transpose()
-                    .log_err()
-                    .flatten()
-            }
-            None => None,
-        };
-
         workspace.update_in(&mut cx, |workspace, window, cx| {
-            let panel = ProjectPanel::new(workspace, window, cx);
-            if let Some(serialized_panel) = serialized_panel {
-                panel.update(cx, |panel, cx| {
-                    panel.width = serialized_panel.width.map(|px| px.round());
-                    cx.notify();
-                });
-            }
-            panel
+            ProjectPanel::new(workspace, window, cx)
         })
     }
 
@@ -1120,40 +1099,6 @@ impl ProjectPanel {
                     cmp::min(*strongest_diagnostic_severity, diagnostic_severity);
             })
             .or_insert(diagnostic_severity);
-    }
-
-    fn serialization_key(workspace: &Workspace) -> Option<String> {
-        workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())
-            .map(|id| format!("{}-{:?}", PROJECT_PANEL_KEY, id))
-    }
-
-    fn serialize(&mut self, cx: &mut Context<Self>) {
-        let Some(serialization_key) = self
-            .workspace
-            .read_with(cx, |workspace, _| {
-                ProjectPanel::serialization_key(workspace)
-            })
-            .ok()
-            .flatten()
-        else {
-            return;
-        };
-        let width = self.width;
-        let kvp = KeyValueStore::global(cx);
-        self.pending_serialization = cx.background_spawn(
-            async move {
-                kvp.write_kvp(
-                    serialization_key,
-                    serde_json::to_string(&SerializedProjectPanel { width })?,
-                )
-                .await?;
-                anyhow::Ok(())
-            }
-            .log_err(),
-        );
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2579,8 +2524,9 @@ impl ProjectPanel {
                 .map(|entry| entry.to_owned())
                 .collect();
 
-        let mode = ProjectPanelSettings::get_global(cx).sort_mode;
-        sort_worktree_entries_with_mode(&mut siblings, mode);
+        let sort_mode = ProjectPanelSettings::get_global(cx).sort_mode;
+        let sort_order = ProjectPanelSettings::get_global(cx).sort_order;
+        sort_worktree_entries(&mut siblings, sort_mode, sort_order);
         let sibling_entry_index = siblings
             .iter()
             .position(|sibling| sibling.id == latest_entry.id)?;
@@ -3124,7 +3070,7 @@ impl ProjectPanel {
 
                 new_path.push(RelPath::unix(&new_file_name).unwrap());
 
-                disambiguation_range = Some(file_name_len..(file_name_len + disambiguation_len));
+                disambiguation_range = Some(0..(file_name_len + disambiguation_len));
                 ix += 1;
             }
         }
@@ -4009,6 +3955,7 @@ impl ProjectPanel {
         let auto_collapse_dirs = settings.auto_fold_dirs;
         let hide_gitignore = settings.hide_gitignore;
         let sort_mode = settings.sort_mode;
+        let sort_order = settings.sort_order;
         let project = self.project.read(cx);
         let repo_snapshots = project.git_store().read(cx).repo_snapshots(cx);
 
@@ -4240,9 +4187,10 @@ impl ProjectPanel {
                             entry_iter.advance();
                         }
 
-                        par_sort_worktree_entries_with_mode(
+                        par_sort_worktree_entries(
                             &mut visible_worktree_entries,
                             sort_mode,
+                            sort_order,
                         );
                         new_state.visible_entries.push(VisibleEntriesForWorktree {
                             worktree_id,
@@ -5445,6 +5393,10 @@ impl ProjectPanel {
                 false
             }
         };
+        let git_indicator = settings
+            .git_status_indicator
+            .then(|| git_status_indicator(details.git_status))
+            .flatten();
 
         let id: ElementId = if is_sticky {
             SharedString::from(format!("project_panel_sticky_item_{}", entry_id.to_usize())).into()
@@ -5780,7 +5732,10 @@ impl ProjectPanel {
                 }),
             )
             .child({
-                let end_slot = if canonical_path.is_some() || diagnostic_count.is_some() {
+                let end_slot = if canonical_path.is_some()
+                    || diagnostic_count.is_some()
+                    || git_indicator.is_some()
+                {
                     let symlink_element = canonical_path.map(|path| {
                         div()
                             .id("symlink_icon")
@@ -5818,6 +5773,20 @@ impl ProjectPanel {
                                         )
                                     },
                                 )
+                            })
+                            .when_some(git_indicator, |this, (label, color)| {
+                                let git_indicator = if kind.is_dir() {
+                                    Indicator::dot()
+                                        .color(Color::Custom(color.color(cx).opacity(0.5)))
+                                        .into_any_element()
+                                } else {
+                                    Label::new(label)
+                                        .size(LabelSize::Small)
+                                        .color(color)
+                                        .into_any_element()
+                                };
+
+                                this.child(git_indicator)
                             })
                             .when_some(symlink_element, |this, el| this.child(el))
                             .into_any_element(),
@@ -6677,7 +6646,8 @@ impl Render for ProjectPanel {
                     this.on_drag_move(cx.listener(handle_drag_move::<ExternalPaths>))
                         .on_drag_move(cx.listener(handle_drag_move::<DraggedSelection>))
                 })
-                .size_full()
+                .w_full()
+                .when(!self.embedded, |this| this.h_full())
                 .relative()
                 .on_modifiers_changed(cx.listener(
                     |this, event: &ModifiersChangedEvent, window, cx| {
@@ -6963,176 +6933,195 @@ impl Render for ProjectPanel {
                             })
                             .track_scroll(&self.scroll_handle),
                         )
-                        .child(
-                            div()
-                                .id("project-panel-blank-area")
-                                .block_mouse_except_scroll()
-                                .flex_grow()
-                                .on_scroll_wheel({
-                                    let scroll_handle = self.scroll_handle.clone();
-                                    let entity_id = cx.entity().entity_id();
-                                    move |event, window, cx| {
-                                        let state = scroll_handle.0.borrow();
-                                        let base_handle = &state.base_handle;
-                                        let current_offset = base_handle.offset();
-                                        let max_offset = base_handle.max_offset();
-                                        let delta = event.delta.pixel_delta(window.line_height());
-                                        let new_offset = (current_offset + delta)
-                                            .clamp(&max_offset.neg(), &Point::default());
+                        .when(!self.embedded, |this| {
+                            this.child(
+                                div()
+                                    .id("project-panel-blank-area")
+                                    .block_mouse_except_scroll()
+                                    .flex_grow()
+                                    .on_scroll_wheel({
+                                        let scroll_handle = self.scroll_handle.clone();
+                                        let entity_id = cx.entity().entity_id();
+                                        move |event, window, cx| {
+                                            let state = scroll_handle.0.borrow();
+                                            let base_handle = &state.base_handle;
+                                            let current_offset = base_handle.offset();
+                                            let max_offset = base_handle.max_offset();
+                                            let delta =
+                                                event.delta.pixel_delta(window.line_height());
+                                            let new_offset = (current_offset + delta)
+                                                .clamp(&max_offset.neg(), &Point::default());
 
-                                        if new_offset != current_offset {
-                                            base_handle.set_offset(new_offset);
-                                            cx.notify(entity_id);
+                                            if new_offset != current_offset {
+                                                base_handle.set_offset(new_offset);
+                                                cx.notify(entity_id);
+                                            }
                                         }
-                                    }
-                                })
-                                .when(
-                                    self.drag_target_entry.as_ref().is_some_and(
-                                        |entry| match entry {
-                                            DragTarget::Background => true,
-                                            DragTarget::Entry {
-                                                highlight_entry_id, ..
-                                            } => self.state.last_worktree_root_id.is_some_and(
-                                                |root_id| *highlight_entry_id == root_id,
-                                            ),
-                                        },
-                                    ),
-                                    |div| div.bg(cx.theme().colors().drop_target_background),
-                                )
-                                .on_drag_move::<ExternalPaths>(cx.listener(
-                                    move |this, event: &DragMoveEvent<ExternalPaths>, _, _| {
-                                        let Some(_last_root_id) = this.state.last_worktree_root_id
-                                        else {
-                                            return;
-                                        };
-                                        if event.bounds.contains(&event.event.position) {
-                                            this.drag_target_entry = Some(DragTarget::Background);
-                                        } else if this
-                                            .drag_target_entry
-                                            .as_ref()
-                                            .is_some_and(|e| matches!(e, DragTarget::Background))
-                                        {
-                                            this.drag_target_entry = None;
-                                        }
-                                    },
-                                ))
-                                .on_drag_move::<DraggedSelection>(cx.listener(
-                                    move |this, event: &DragMoveEvent<DraggedSelection>, _, cx| {
-                                        let Some(last_root_id) = this.state.last_worktree_root_id
-                                        else {
-                                            return;
-                                        };
-                                        if event.bounds.contains(&event.event.position) {
-                                            let drag_state = event.drag(cx);
-                                            if this.should_highlight_background_for_selection_drag(
-                                                &drag_state,
-                                                last_root_id,
-                                                cx,
-                                            ) {
+                                    })
+                                    .when(
+                                        self.drag_target_entry.as_ref().is_some_and(|entry| {
+                                            match entry {
+                                                DragTarget::Background => true,
+                                                DragTarget::Entry {
+                                                    highlight_entry_id, ..
+                                                } => self.state.last_worktree_root_id.is_some_and(
+                                                    |root_id| *highlight_entry_id == root_id,
+                                                ),
+                                            }
+                                        }),
+                                        |div| div.bg(cx.theme().colors().drop_target_background),
+                                    )
+                                    .on_drag_move::<ExternalPaths>(cx.listener(
+                                        move |this, event: &DragMoveEvent<ExternalPaths>, _, _| {
+                                            let Some(_last_root_id) =
+                                                this.state.last_worktree_root_id
+                                            else {
+                                                return;
+                                            };
+                                            if event.bounds.contains(&event.event.position) {
                                                 this.drag_target_entry =
                                                     Some(DragTarget::Background);
-                                            }
-                                        } else if this
-                                            .drag_target_entry
-                                            .as_ref()
-                                            .is_some_and(|e| matches!(e, DragTarget::Background))
-                                        {
-                                            this.drag_target_entry = None;
-                                        }
-                                    },
-                                ))
-                                .on_drop(cx.listener(
-                                    move |this, external_paths: &ExternalPaths, window, cx| {
-                                        this.drag_target_entry = None;
-                                        this.hover_scroll_task.take();
-                                        if let Some(entry_id) = this.state.last_worktree_root_id {
-                                            this.drop_external_files(
-                                                external_paths.paths(),
-                                                entry_id,
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                        cx.stop_propagation();
-                                    },
-                                ))
-                                .on_drop(cx.listener(
-                                    move |this, selections: &DraggedSelection, window, cx| {
-                                        this.drag_target_entry = None;
-                                        this.hover_scroll_task.take();
-                                        if let Some(entry_id) = this.state.last_worktree_root_id {
-                                            this.drag_onto(selections, entry_id, false, window, cx);
-                                        }
-                                        cx.stop_propagation();
-                                    },
-                                ))
-                                .on_click(cx.listener(|this, event, window, cx| {
-                                    if matches!(event, gpui::ClickEvent::Keyboard(_)) {
-                                        return;
-                                    }
-                                    cx.stop_propagation();
-                                    this.selection = None;
-                                    this.marked_entries.clear();
-                                    this.focus_handle(cx).focus(window, cx);
-                                }))
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                        if let Some(entry_id) = this.state.last_worktree_root_id {
-                                            this.deploy_context_menu(
-                                                event.position,
-                                                entry_id,
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                    }),
-                                )
-                                .when(!is_read_only, |el| {
-                                    el.on_click(cx.listener(
-                                        |this, event: &gpui::ClickEvent, window, cx| {
-                                            if event.click_count() > 1
-                                                && let Some(entry_id) =
-                                                    this.state.last_worktree_root_id
-                                            {
-                                                let project = this.project.read(cx);
-
-                                                let worktree_id = if let Some(worktree) =
-                                                    project.worktree_for_entry(entry_id, cx)
-                                                {
-                                                    worktree.read(cx).id()
-                                                } else {
-                                                    return;
-                                                };
-
-                                                this.selection = Some(SelectedEntry {
-                                                    worktree_id,
-                                                    entry_id,
-                                                });
-
-                                                this.new_file(&NewFile, window, cx);
+                                            } else if this.drag_target_entry.as_ref().is_some_and(
+                                                |e| matches!(e, DragTarget::Background),
+                                            ) {
+                                                this.drag_target_entry = None;
                                             }
                                         },
                                     ))
-                                }),
-                        )
-                        .size_full(),
+                                    .on_drag_move::<DraggedSelection>(cx.listener(
+                                        move |this,
+                                              event: &DragMoveEvent<DraggedSelection>,
+                                              _,
+                                              cx| {
+                                            let Some(last_root_id) =
+                                                this.state.last_worktree_root_id
+                                            else {
+                                                return;
+                                            };
+                                            if event.bounds.contains(&event.event.position) {
+                                                let drag_state = event.drag(cx);
+                                                if this
+                                                    .should_highlight_background_for_selection_drag(
+                                                        &drag_state,
+                                                        last_root_id,
+                                                        cx,
+                                                    )
+                                                {
+                                                    this.drag_target_entry =
+                                                        Some(DragTarget::Background);
+                                                }
+                                            } else if this.drag_target_entry.as_ref().is_some_and(
+                                                |e| matches!(e, DragTarget::Background),
+                                            ) {
+                                                this.drag_target_entry = None;
+                                            }
+                                        },
+                                    ))
+                                    .on_drop(cx.listener(
+                                        move |this, external_paths: &ExternalPaths, window, cx| {
+                                            this.drag_target_entry = None;
+                                            this.hover_scroll_task.take();
+                                            if let Some(entry_id) = this.state.last_worktree_root_id
+                                            {
+                                                this.drop_external_files(
+                                                    external_paths.paths(),
+                                                    entry_id,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            cx.stop_propagation();
+                                        },
+                                    ))
+                                    .on_drop(cx.listener(
+                                        move |this, selections: &DraggedSelection, window, cx| {
+                                            this.drag_target_entry = None;
+                                            this.hover_scroll_task.take();
+                                            if let Some(entry_id) = this.state.last_worktree_root_id
+                                            {
+                                                this.drag_onto(
+                                                    selections, entry_id, false, window, cx,
+                                                );
+                                            }
+                                            cx.stop_propagation();
+                                        },
+                                    ))
+                                    .on_click(cx.listener(|this, event, window, cx| {
+                                        if matches!(event, gpui::ClickEvent::Keyboard(_)) {
+                                            return;
+                                        }
+                                        cx.stop_propagation();
+                                        this.selection = None;
+                                        this.marked_entries.clear();
+                                        this.focus_handle(cx).focus(window, cx);
+                                    }))
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(
+                                            move |this, event: &MouseDownEvent, window, cx| {
+                                                if let Some(entry_id) =
+                                                    this.state.last_worktree_root_id
+                                                {
+                                                    this.deploy_context_menu(
+                                                        event.position,
+                                                        entry_id,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                            },
+                                        ),
+                                    )
+                                    .when(!is_read_only, |el| {
+                                        el.on_click(cx.listener(
+                                            |this, event: &gpui::ClickEvent, window, cx| {
+                                                if event.click_count() > 1
+                                                    && let Some(entry_id) =
+                                                        this.state.last_worktree_root_id
+                                                {
+                                                    let project = this.project.read(cx);
+
+                                                    let worktree_id = if let Some(worktree) =
+                                                        project.worktree_for_entry(entry_id, cx)
+                                                    {
+                                                        worktree.read(cx).id()
+                                                    } else {
+                                                        return;
+                                                    };
+
+                                                    this.selection = Some(SelectedEntry {
+                                                        worktree_id,
+                                                        entry_id,
+                                                    });
+
+                                                    this.new_file(&NewFile, window, cx);
+                                                }
+                                            },
+                                        ))
+                                    }),
+                            )
+                            .h_full()
+                        })
+                        .w_full(),
                 )
-                .custom_scrollbars(
-                    {
-                        let mut scrollbars = Scrollbars::for_settings::<ProjectPanelSettings>()
-                            .tracked_scroll_handle(&self.scroll_handle);
-                        if horizontal_scroll {
-                            scrollbars = scrollbars.with_track_along(
-                                ScrollAxes::Horizontal,
-                                cx.theme().colors().panel_background,
-                            );
-                        }
-                        scrollbars.notify_content()
-                    },
-                    window,
-                    cx,
-                )
+                .when(!self.embedded, |this| {
+                    this.custom_scrollbars(
+                        {
+                            let mut scrollbars =
+                                Scrollbars::for_settings::<ProjectPanelScrollbarProxy>()
+                                    .tracked_scroll_handle(&self.scroll_handle);
+                            if horizontal_scroll {
+                                scrollbars = scrollbars.with_track_along(
+                                    ScrollAxes::Horizontal,
+                                    cx.theme().colors().panel_background,
+                                );
+                            }
+                            scrollbars.notify_content()
+                        },
+                        window,
+                        cx,
+                    )
+                })
                 .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                     deferred(
                         anchored()
@@ -7205,7 +7194,7 @@ impl Render for ProjectPanel {
                                     .workspace
                                     .update(cx, |workspace, cx| {
                                         workspace.open_workspace_for_paths(
-                                            true,
+                                            workspace::OpenMode::Activate,
                                             external_paths.paths().to_owned(),
                                             window,
                                             cx,
@@ -7289,17 +7278,8 @@ impl Panel for ProjectPanel {
         });
     }
 
-    fn size(&self, _: &Window, cx: &App) -> Pixels {
-        self.width
-            .unwrap_or_else(|| ProjectPanelSettings::get_global(cx).default_width)
-    }
-
-    fn set_size(&mut self, size: Option<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        self.width = size;
-        cx.notify();
-        cx.defer_in(window, |this, _, cx| {
-            this.serialize(cx);
-        });
+    fn default_size(&self, _: &Window, cx: &App) -> Pixels {
+        ProjectPanelSettings::get_global(cx).default_width
     }
 
     fn icon(&self, _: &Window, cx: &App) -> Option<IconName> {
@@ -7338,7 +7318,7 @@ impl Panel for ProjectPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        0
+        1
     }
 }
 
@@ -7368,41 +7348,56 @@ impl ClipboardEntry {
 }
 
 #[inline]
-fn cmp_directories_first(a: &Entry, b: &Entry) -> cmp::Ordering {
-    util::paths::compare_rel_paths((&a.path, a.is_file()), (&b.path, b.is_file()))
+fn cmp_worktree_entries(
+    a: &Entry,
+    b: &Entry,
+    mode: &settings::ProjectPanelSortMode,
+    order: &settings::ProjectPanelSortOrder,
+) -> cmp::Ordering {
+    let a = (&*a.path, a.is_file());
+    let b = (&*b.path, b.is_file());
+    util::paths::compare_rel_paths_by(a, b, (*mode).into(), (*order).into())
 }
 
-#[inline]
-fn cmp_mixed(a: &Entry, b: &Entry) -> cmp::Ordering {
-    util::paths::compare_rel_paths_mixed((&a.path, a.is_file()), (&b.path, b.is_file()))
-}
-
-#[inline]
-fn cmp_files_first(a: &Entry, b: &Entry) -> cmp::Ordering {
-    util::paths::compare_rel_paths_files_first((&a.path, a.is_file()), (&b.path, b.is_file()))
-}
-
-#[inline]
-fn cmp_with_mode(a: &Entry, b: &Entry, mode: &settings::ProjectPanelSortMode) -> cmp::Ordering {
-    match mode {
-        settings::ProjectPanelSortMode::DirectoriesFirst => cmp_directories_first(a, b),
-        settings::ProjectPanelSortMode::Mixed => cmp_mixed(a, b),
-        settings::ProjectPanelSortMode::FilesFirst => cmp_files_first(a, b),
-    }
-}
-
-pub fn sort_worktree_entries_with_mode(
+pub fn sort_worktree_entries(
     entries: &mut [impl AsRef<Entry>],
     mode: settings::ProjectPanelSortMode,
+    order: settings::ProjectPanelSortOrder,
 ) {
-    entries.sort_by(|lhs, rhs| cmp_with_mode(lhs.as_ref(), rhs.as_ref(), &mode));
+    entries.sort_by(|lhs, rhs| cmp_worktree_entries(lhs.as_ref(), rhs.as_ref(), &mode, &order));
 }
 
-pub fn par_sort_worktree_entries_with_mode(
+pub fn par_sort_worktree_entries(
     entries: &mut Vec<GitEntry>,
     mode: settings::ProjectPanelSortMode,
+    order: settings::ProjectPanelSortOrder,
 ) {
-    entries.par_sort_by(|lhs, rhs| cmp_with_mode(lhs, rhs, &mode));
+    entries.par_sort_by(|lhs, rhs| cmp_worktree_entries(lhs, rhs, &mode, &order));
+}
+
+fn git_status_indicator(git_status: GitSummary) -> Option<(&'static str, Color)> {
+    if git_status.conflict > 0 {
+        return Some(("!", Color::Conflict));
+    }
+    if git_status.untracked > 0 {
+        return Some(("U", Color::Created));
+    }
+    if git_status.worktree.deleted > 0 {
+        return Some(("D", Color::Deleted));
+    }
+    if git_status.worktree.modified > 0 {
+        return Some(("M", Color::Warning));
+    }
+    if git_status.index.deleted > 0 {
+        return Some(("D", Color::Deleted));
+    }
+    if git_status.index.modified > 0 {
+        return Some(("M", Color::Modified));
+    }
+    if git_status.index.added > 0 {
+        return Some(("A", Color::Created));
+    }
+    None
 }
 
 #[cfg(test)]

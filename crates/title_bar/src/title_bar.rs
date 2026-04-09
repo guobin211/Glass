@@ -51,7 +51,7 @@ use util::ResultExt;
 #[allow(unused_imports)]
 use workspace::{
     CloseProjectNavigation, FocusProjectNavigation, MultiWorkspace, Pane, TitleBarItemViewHandle,
-    ToggleProjectNavigation, ToggleWorktreeSecurity, Workspace, WorkspaceId,
+    ToggleProjectNavigation, ToggleRightDock, ToggleWorktreeSecurity, Workspace, WorkspaceId,
     notifications::NotifyResultExt,
 };
 use workspace_chrome::ModeControl;
@@ -59,6 +59,7 @@ use workspace_chrome::ModeControl;
 use workspace_modes::{
     ModeId, ModeViewRegistry, SwitchToBrowserMode, SwitchToEditorMode, SwitchToTerminalMode,
 };
+
 use zed_actions::OpenRemote;
 
 pub use onboarding_banner::restore_banner;
@@ -253,7 +254,7 @@ impl TitleBar {
                 .and_then(|reg| reg.titlebar_center_view(mode_id).cloned())
         });
 
-        if let Some(center_view) = titlebar_center {
+        if let Some(center_view) = titlebar_center.clone() {
             children.push(
                 div()
                     .flex_1()
@@ -298,6 +299,7 @@ impl TitleBar {
                     |this| this.child(self.render_sign_in_button(cx)),
                 )
                 .child(self.render_organization_menu_button(cx))
+                .child(self.render_right_dock_toggle(cx))
                 .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
                     this.child(self.render_user_menu_button(cx))
                 })
@@ -370,6 +372,7 @@ impl TitleBar {
         };
 
         let workspace_handle = workspace.weak_handle().upgrade().unwrap();
+        let title_bar = cx.entity().downgrade();
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.observe(&workspace_handle, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe_in(
@@ -407,7 +410,12 @@ impl TitleBar {
             }),
         );
         subscriptions.push(cx.observe(&user_store, |_a, _, cx| cx.notify()));
-        subscriptions.push(cx.observe_button_layout_changed(window, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_button_layout_changed(window, move |_, _, cx| {
+            let title_bar = title_bar.clone();
+            cx.defer(move |cx| {
+                title_bar.update(cx, |_, cx| cx.notify()).ok();
+            });
+        }));
         if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
             subscriptions.push(cx.subscribe(&trusted_worktrees, |_, _, _, cx| {
                 cx.notify();
@@ -420,7 +428,7 @@ impl TitleBar {
                 IconName::AiClaude,
                 "Claude Agent",
                 Some("Introducing:".into()),
-                zed_actions::agent::OpenClaudeAgentOnboardingModal.boxed_clone(),
+                zed_actions::agent::OpenAcpOnboardingModal.boxed_clone(),
                 cx,
             )
             // When updating this to a non-AI feature release, remove this line.
@@ -955,6 +963,29 @@ impl TitleBar {
                 .into_any_element(),
         )
     }
+
+    fn render_right_dock_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let is_open = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).right_dock().read(cx).is_open())
+            .unwrap_or(false);
+        let icon = if is_open {
+            IconName::ThreadsSidebarRightOpen
+        } else {
+            IconName::ThreadsSidebarRightClosed
+        };
+
+        IconButton::new("toggle-right-dock", icon)
+            .icon_size(IconSize::Small)
+            .toggle_state(is_open)
+            .tooltip(|_, cx| Tooltip::for_action("Toggle Right Dock", &ToggleRightDock, cx))
+            .on_click(|_, window, cx| {
+                window.dispatch_action(ToggleRightDock.boxed_clone(), cx);
+            })
+            .into_any_element()
+    }
+
     fn render_project_name(
         &self,
         name: Option<SharedString>,

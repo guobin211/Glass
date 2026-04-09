@@ -36,7 +36,7 @@ use workspace::{
     Workspace,
     item::{Item, ItemEvent, TabTooltipContent, WorkspaceItemKind},
 };
-use workspace_modes::ModeNavigationEntry;
+use workspace_modes::{ModeId, ModeNavigationEntry, ModeViewRegistry};
 
 const MAX_CLOSED_TABS: usize = 20;
 
@@ -1246,7 +1246,7 @@ impl Item for BrowserPaneItem {
         Some(ui::Icon::new(ui::IconName::Globe))
     }
 
-    fn workspace_item_kind(&self) -> Option<WorkspaceItemKind> {
+    fn workspace_item_kind(&self, _cx: &App) -> Option<WorkspaceItemKind> {
         Some(WorkspaceItemKind::Browser)
     }
 

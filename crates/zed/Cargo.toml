@@ -2,7 +2,7 @@
 description = "Glass - A high-performance code editor"
 edition.workspace = true
 name = "zed"
-version = "0.0.1"
+version = "0.233.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Glass HQ <team@glass.dev>"]
@@ -13,6 +13,8 @@ workspace = true
 
 [features]
 tracy = ["ztracing/tracy"]
+# LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
+track-project-leak = ["gpui/leak-detection"]
 test-support = [
     "gpui/test-support",
     "gpui/screen-capture",
@@ -65,7 +67,7 @@ activity_indicator.workspace = true
 agent.workspace = true
 agent-client-protocol.workspace = true
 agent_settings.workspace = true
-agent_ui.workspace = true
+agent_ui = { workspace = true, features = ["audio"] }
 anyhow.workspace = true
 app_runtime_ui.workspace = true
 askpass.workspace = true
@@ -159,12 +161,15 @@ nc.workspace = true
 node_runtime.workspace = true
 notifications.workspace = true
 onboarding.workspace = true
+outline.workspace = true
+outline_panel.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
 picker.workspace = true
 profiling.workspace = true
 project.workspace = true
 project_panel.workspace = true
+project_symbols.workspace = true
 prompt_store.workspace = true
 proto.workspace = true
 recent_projects.workspace = true
@@ -196,6 +201,7 @@ telemetry.workspace = true
 telemetry_events.workspace = true
 terminal_view.workspace = true
 theme.workspace = true
+theme_settings.workspace = true
 theme_extension.workspace = true
 theme_selector.workspace = true
 time.workspace = true

@@ -13,7 +13,7 @@ use language::language_settings::{EditPredictionProvider, all_language_settings}
 use client::proto;
 use collections::HashSet;
 use editor::{Editor, EditorEvent};
-use gpui::{Corner, Entity, Subscription, Task, WeakEntity, actions};
+use gpui::{App, Corner, Entity, EventEmitter, Subscription, Task, WeakEntity, actions};
 use language::{BinaryStatus, BufferId, ServerHealth};
 use lsp::{LanguageServerId, LanguageServerName, LanguageServerSelector};
 use project::{
@@ -22,13 +22,13 @@ use project::{
 };
 use settings::{Settings as _, SettingsStore};
 use ui::{
-    ContextMenu, ContextMenuEntry, IconButtonShape, Indicator, PopoverMenu, PopoverMenuHandle,
-    Tooltip, prelude::*,
+    ContextMenu, ContextMenuEntry, Indicator, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*,
 };
 
 use util::{ResultExt, paths::PathExt, rel_path::RelPath};
-use workspace::TitleBarItemView;
-use workspace::Workspace;
+use workspace::{
+    TitleBarItemView, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
+};
 
 use crate::lsp_log_view;
 
@@ -799,6 +799,10 @@ impl LspButton {
                 } else if lsp_button.lsp_menu.take().is_some() {
                     cx.notify();
                 }
+
+                cx.emit(ToolbarItemEvent::ChangeLocation(
+                    lsp_button.toolbar_location(cx),
+                ));
             });
 
         let lsp_store = workspace.project().read(cx).lsp_store();
@@ -839,6 +843,23 @@ impl LspButton {
         }
 
         lsp_button
+    }
+
+    pub fn toggle_menu(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.toolbar_location(cx) == ToolbarItemLocation::PrimaryRight && self.lsp_menu.is_some()
+        {
+            self.popover_menu_handle.toggle(window, cx);
+        }
+    }
+
+    fn toolbar_location(&self, cx: &App) -> ToolbarItemLocation {
+        if ProjectSettings::get_global(cx).global_lsp_settings.button
+            && self.server_state.read(cx).active_editor.is_some()
+        {
+            ToolbarItemLocation::PrimaryRight
+        } else {
+            ToolbarItemLocation::Hidden
+        }
     }
 
     fn on_lsp_store_event(
@@ -1175,13 +1196,20 @@ impl TitleBarItemView for LspButton {
                         .and_then(|active_editor| active_editor.editor.upgrade())
                         .as_ref()
                 {
-                    let editor_buffers =
-                        HashSet::from_iter(editor.read(cx).buffer().read(cx).excerpt_buffer_ids());
+                    let editor_buffers = HashSet::from_iter(
+                        editor
+                            .read(cx)
+                            .buffer()
+                            .read(cx)
+                            .snapshot(cx)
+                            .excerpts()
+                            .map(|excerpt| excerpt.context.start.buffer_id),
+                    );
                     let _editor_subscription = cx.subscribe_in(
                         &editor,
                         window,
                         |lsp_button, _, e: &EditorEvent, window, cx| match e {
-                            EditorEvent::ExcerptsAdded { buffer, .. } => {
+                            EditorEvent::BufferRangesUpdated { buffer, .. } => {
                                 let updated = lsp_button.server_state.update(cx, |state, cx| {
                                     if let Some(active_editor) = state.active_editor.as_mut() {
                                         let buffer_id = buffer.read(cx).remote_id();
@@ -1194,9 +1222,7 @@ impl TitleBarItemView for LspButton {
                                     lsp_button.refresh_lsp_menu(false, window, cx);
                                 }
                             }
-                            EditorEvent::ExcerptsRemoved {
-                                removed_buffer_ids, ..
-                            } => {
+                            EditorEvent::BuffersRemoved { removed_buffer_ids } => {
                                 let removed = lsp_button.server_state.update(cx, |state, _| {
                                     let mut removed = false;
                                     if let Some(active_editor) = state.active_editor.as_mut() {
@@ -1241,14 +1267,30 @@ impl TitleBarItemView for LspButton {
     }
 }
 
-fn dock_trigger_button(id: &'static str, indicator: Option<Indicator>, cx: &mut App) -> IconButton {
+impl EventEmitter<ToolbarItemEvent> for LspButton {}
+
+impl ToolbarItemView for LspButton {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn workspace::ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolbarItemLocation {
+        TitleBarItemView::set_active_pane_item(self, active_pane_item, window, cx);
+        self.toolbar_location(cx)
+    }
+}
+
+fn toolbar_trigger_button(
+    id: &'static str,
+    indicator: Option<Indicator>,
+    cx: &mut App,
+) -> IconButton {
     IconButton::new(id, IconName::BoltOutlined)
-        .shape(IconButtonShape::Square)
-        .style(ButtonStyle::Transparent)
-        .size(ButtonSize::Compact)
+        .style(ButtonStyle::Subtle)
         .icon_size(IconSize::Small)
         .when_some(indicator, IconButton::indicator)
-        .indicator_border_color(Some(cx.theme().colors().elevated_surface_background))
+        .indicator_border_color(Some(cx.theme().colors().toolbar_background))
 }
 
 impl Render for LspButton {
@@ -1278,7 +1320,7 @@ impl Render for LspButton {
                     .anchor(Corner::BottomLeft)
                     .with_handle(self.popover_menu_handle.clone())
                     .trigger_with_tooltip(
-                        dock_trigger_button("zed-lsp-tool-button", None, cx),
+                        toolbar_trigger_button("zed-lsp-tool-button", None, cx),
                         move |_window, cx| {
                             Tooltip::with_meta(
                                 "Language Servers",
@@ -1353,7 +1395,7 @@ impl Render for LspButton {
                 .anchor(Corner::BottomLeft)
                 .with_handle(self.popover_menu_handle.clone())
                 .trigger_with_tooltip(
-                    dock_trigger_button("zed-lsp-tool-button", indicator, cx),
+                    toolbar_trigger_button("zed-lsp-tool-button", indicator, cx),
                     move |_window, cx| {
                         Tooltip::with_meta("Language Servers", Some(&ToggleMenu), description, cx)
                     },

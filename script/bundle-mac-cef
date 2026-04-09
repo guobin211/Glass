@@ -9,6 +9,7 @@ set -euo pipefail
 CEF_PATH="${CEF_PATH:-$HOME/.local/share/cef}"
 BUILD_TYPE="${1:-debug}"
 OPEN_AFTER_BUILD="${2:-false}"
+CARGO_CMD="${CARGO:-cargo}"
 
 # Validate CEF installation
 if [[ ! -d "$CEF_PATH" ]]; then
@@ -41,14 +42,15 @@ host_line=$(echo "$version_info" | grep host)
 target_triple=${host_line#*: }
 
 echo "Building for: $target_triple ($BUILD_TYPE)"
+echo "Using cargo command: $CARGO_CMD"
 
 # Build the main application
 echo "Building zed..."
-cargo build $BUILD_FLAG --features mimalloc --package zed --target $target_triple
+"$CARGO_CMD" build $BUILD_FLAG --features mimalloc --package zed --target $target_triple
 
 # Build the helper executable
 echo "Building glass_helper..."
-cargo build $BUILD_FLAG --package browser --bin glass_helper --target $target_triple
+"$CARGO_CMD" build $BUILD_FLAG --package browser --bin glass_helper --target $target_triple
 
 # Set up paths
 BINARY_PATH="target/${target_triple}/${TARGET_DIR}/zed"
@@ -189,6 +191,8 @@ cat > "$APP_PATH/Contents/Info.plist" << 'PLIST'
     <string>Glass needs camera access for video features</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Glass needs microphone access for audio features</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Glass needs Bluetooth access for browser features that interact with nearby devices</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
