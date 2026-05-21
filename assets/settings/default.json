@@ -112,6 +112,11 @@
   // 2. Maps `Control` on Linux and Windows and to `Command` on MacOS:
   //    "cmd_or_ctrl" (alias: "cmd", "ctrl")
   "multi_cursor_modifier": "alt",
+  // Whether to enable vim modes and key bindings.
+  "vim_mode": false,
+  // Whether to enable helix mode and key bindings.
+  // Enabling this mode will automatically enable vim mode.
+  "helix_mode": false,
   // Whether to show the informational hover box when moving the mouse
   // over symbols in the editor.
   "hover_popover_enabled": true,
@@ -629,6 +634,9 @@
   // Scroll sensitivity multiplier. This multiplier is applied
   // to both the horizontal and vertical delta values while scrolling.
   "scroll_sensitivity": 1.0,
+  // Whether to zoom the editor font size with the mouse wheel
+  // while holding the primary modifier key (Cmd on macOS, Ctrl on other platforms).
+  "mouse_wheel_zoom": false,
   // Scroll sensitivity multiplier for fast scrolling. This multiplier is applied
   // to both the horizontal and vertical delta values while scrolling. Fast scrolling
   // happens when a user holds the alt or option key while scrolling.
@@ -956,7 +964,7 @@
     //
     // Default: true
     "flexible": true,
-    // Where to position the sidebar. Can be 'left' or 'right'.
+    // Where to position the threads sidebar. Can be 'left' or 'right'.
     "sidebar_side": "left",
     // Default width when the agent panel is docked to the left or right.
     "default_width": 640,
@@ -1067,7 +1075,7 @@
           "terminal": true,
           "thinking": true,
           "update_plan": true,
-          "web_search": true,
+          "search_web": true,
         },
       },
       "ask": {
@@ -1087,7 +1095,7 @@
           "spawn_agent": true,
           "thinking": true,
           "update_plan": true,
-          "web_search": true,
+          "search_web": true,
         },
       },
       "minimal": {
@@ -2383,6 +2391,26 @@
     // Maximum number of columns of output to display before scaling images.
     // Set to 0 to disable output width limits.
     "output_max_width_columns": 0,
+  },
+  // Vim settings
+  "vim": {
+    "default_mode": "normal",
+    "toggle_relative_line_numbers": false,
+    "use_system_clipboard": "always",
+    "use_smartcase_find": false,
+    "use_regex_search": true,
+    "gdefault": false,
+    "highlight_on_yank_duration": 200,
+    "custom_digraphs": {},
+    // Cursor shape for each mode.
+    // The shape can be one of the following: "block", "bar", "underline", "hollow".
+    "cursor_shape": {
+      "normal": "block",
+      "replace": "underline",
+      "visual": "block",
+      // Set to "inherit" to use the editor's cursor_shape.
+      "insert": "inherit",
+    },
   },
   // Which-key popup settings
   "which_key": {

@@ -43,12 +43,22 @@ impl Default for RenderState {
 #[derive(Clone)]
 pub struct OsrRenderHandler {
     state: Arc<Mutex<RenderState>>,
+    #[cfg(target_os = "macos")]
     sender: EventSender,
 }
 
 impl OsrRenderHandler {
     pub fn new(state: Arc<Mutex<RenderState>>, sender: EventSender) -> Self {
-        Self { state, sender }
+        #[cfg(target_os = "macos")]
+        {
+            Self { state, sender }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = sender;
+            Self { state }
+        }
     }
 }
 

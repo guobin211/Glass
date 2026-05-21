@@ -84,13 +84,19 @@ pub(crate) enum TabEvent {
     LoadingStateChanged,
     PageChromeChanged,
     TextInputStateChanged(BrowserTextInputState),
+    #[cfg(target_os = "macos")]
     FrameReady,
     NavigateToUrl(String),
     OpenNewTab(String),
     OpenTargetRequested(OpenTargetRequest),
     FaviconChanged,
-    LoadError { url: String, error_text: String },
-    ContextMenuOpen { context: ContextMenuContext },
+    LoadError {
+        url: String,
+        error_text: String,
+    },
+    ContextMenuOpen {
+        context: ContextMenuContext,
+    },
     FindResult(FindResultEvent),
     DownloadUpdated(DownloadUpdatedEvent),
 }
@@ -217,6 +223,7 @@ impl BrowserTab {
                 BrowserEvent::LoadingProgress(progress) => {
                     self.loading_progress = progress;
                 }
+                #[cfg(target_os = "macos")]
                 BrowserEvent::FrameReady => {
                     cx.emit(TabEvent::FrameReady);
                 }

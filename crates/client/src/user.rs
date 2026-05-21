@@ -5,6 +5,7 @@ use cloud_api_client::websocket_protocol::MessageToClient;
 use cloud_api_client::{
     GetAuthenticatedUserResponse, KnownOrUnknown, Organization, OrganizationId, Plan, PlanInfo,
 };
+use cloud_api_types::OrganizationConfiguration;
 use cloud_llm_client::{
     EDIT_PREDICTIONS_USAGE_AMOUNT_HEADER_NAME, EDIT_PREDICTIONS_USAGE_LIMIT_HEADER_NAME, UsageLimit,
 };
@@ -112,6 +113,7 @@ pub struct UserStore {
     current_organization: Option<Arc<Organization>>,
     organizations: Vec<Arc<Organization>>,
     plans_by_organization: HashMap<OrganizationId, Plan>,
+    configuration_by_organization: HashMap<OrganizationId, OrganizationConfiguration>,
     contacts: Vec<Arc<Contact>>,
     incoming_contact_requests: Vec<Arc<User>>,
     outgoing_contact_requests: Vec<Arc<User>>,
@@ -184,6 +186,7 @@ impl UserStore {
             current_organization: None,
             organizations: Vec::new(),
             plans_by_organization: HashMap::default(),
+            configuration_by_organization: HashMap::default(),
             plan_info: None,
             edit_prediction_usage: None,
             contacts: Default::default(),
@@ -463,6 +466,14 @@ impl UserStore {
         })
     }
 
+    pub fn fuzzy_search_users(
+        &self,
+        query: String,
+        cx: &Context<Self>,
+    ) -> Task<Result<Vec<Arc<User>>>> {
+        self.load_users(proto::FuzzySearchUsers { query }, cx)
+    }
+
     pub fn get_cached_user(&self, user_id: u64) -> Option<Arc<User>> {
         self.users.get(&user_id).cloned()
     }
@@ -530,6 +541,13 @@ impl UserStore {
 
     pub fn plan_for_organization(&self, organization_id: &OrganizationId) -> Option<Plan> {
         self.plans_by_organization.get(organization_id).copied()
+    }
+
+    pub fn current_organization_configuration(&self) -> Option<&OrganizationConfiguration> {
+        let current_organization = self.current_organization.as_ref()?;
+
+        self.configuration_by_organization
+            .get(&current_organization.id)
     }
 
     pub fn plan(&self) -> Option<Plan> {
@@ -652,6 +670,8 @@ impl UserStore {
                 (organization_id, plan)
             })
             .collect();
+        self.configuration_by_organization =
+            response.configuration_by_organization.into_iter().collect();
 
         self.edit_prediction_usage = Some(EditPredictionUsage(RequestUsage {
             limit: response.plan.usage.edit_predictions.limit,

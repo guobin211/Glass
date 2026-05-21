@@ -35,11 +35,10 @@ use git_ui::commit_view::CommitViewToolbar;
 use git_ui::git_panel::GitPanel;
 use git_ui::project_diff::{BranchDiffToolbar, ProjectDiffToolbar};
 use gpui::{
-    Action, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, DismissEvent,
-    Element, Entity, FocusHandle, Focusable, Image, ImageFormat, KeyBinding, ParentElement,
-    PathPromptOptions, PromptLevel, ReadGlobal, SharedString, Size, Task, TitlebarOptions,
-    UpdateGlobal, WeakEntity, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
-    actions, image_cache, img, point, px, retain_all,
+    Action, App, AppContext as _, AsyncWindowContext, Context, DismissEvent, Element, Entity,
+    Focusable, KeyBinding, ParentElement, PathPromptOptions, PromptLevel, ReadGlobal, SharedString,
+    Task, TitlebarOptions, UpdateGlobal, WeakEntity, Window, WindowHandle, WindowKind,
+    WindowOptions, actions, image_cache, px, retain_all,
 };
 use image_viewer::ImageInfo;
 use language::Capability;
@@ -67,7 +66,7 @@ use rope::Rope;
 use search::project_search::ProjectSearchBar;
 use settings::{
     BaseKeymap, DEFAULT_KEYMAP_PATH, InvalidSettingsError, KeybindSource, KeymapFile,
-    KeymapFileLoadResult, MigrationStatus, Settings, SettingsStore,
+    KeymapFileLoadResult, MigrationStatus, Settings, SettingsStore, VIM_KEYMAP_PATH,
     initial_local_debug_tasks_content, initial_project_settings_content, initial_tasks_content,
     update_settings_file,
 };
@@ -86,6 +85,7 @@ use util::markdown::MarkdownString;
 use util::rel_path::RelPath;
 use util::{ResultExt, asset_str, maybe};
 use uuid::Uuid;
+use vim_mode_setting::VimModeSetting;
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
 use workspace_modes::ModeId;
 
@@ -524,6 +524,7 @@ pub fn initialize_workspace(
             cx.new(|_| line_ending_selector::LineEndingIndicator::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
+        let vim_mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
 
         if let Some(title_bar) = workspace
             .titlebar_item()
@@ -531,6 +532,7 @@ pub fn initialize_workspace(
         {
             title_bar.update(cx, |title_bar, cx| {
                 title_bar.add_right_item(image_info, window, cx);
+                title_bar.add_right_item(vim_mode_indicator, window, cx);
                 title_bar.add_right_item(line_ending_indicator, window, cx);
                 title_bar.add_right_item(active_toolchain_language, window, cx);
                 title_bar.add_right_item(active_buffer_encoding, window, cx);
@@ -667,11 +669,25 @@ fn initialize_panels(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<()>> {
+    fn collab_panel_debug_enabled() -> bool {
+        std::env::var_os("GLASS_DEBUG_COLLAB_PANEL").is_some_and(|value| value != "0")
+    }
+
+    fn debug_collab_panel(message: impl AsRef<str>) {
+        let message = message.as_ref();
+        log::info!("[collab-panel] {message}");
+        if collab_panel_debug_enabled() {
+            eprintln!("[collab-panel] {message}");
+        }
+    }
+
     cx.spawn_in(window, async move |workspace_handle, cx| {
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
+        let channels_panel =
+            collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -689,11 +705,59 @@ fn initialize_panels(
             }
         }
 
+        async fn add_collab_panel_when_ready(
+            panel_task: impl Future<
+                    Output = anyhow::Result<Entity<collab_ui::collab_panel::CollabPanel>>,
+                > + 'static,
+            workspace_handle: WeakEntity<Workspace>,
+            mut cx: gpui::AsyncWindowContext,
+        ) {
+            debug_collab_panel("initialize_panels: waiting for collab panel load");
+            match panel_task.await {
+                Ok(panel) => {
+                    debug_collab_panel(format!(
+                        "initialize_panels: collab panel loaded entity_id={:?}",
+                        panel.entity_id()
+                    ));
+                    workspace_handle
+                        .update_in(&mut cx, |workspace, window, cx| {
+                            debug_collab_panel(format!(
+                                "initialize_panels: before add_panel has_collab_panel={}",
+                                workspace
+                                    .panel::<collab_ui::collab_panel::CollabPanel>(cx)
+                                    .is_some()
+                            ));
+                            workspace.add_panel(panel, window, cx);
+                            debug_collab_panel(format!(
+                                "initialize_panels: after add_panel has_collab_panel={} right_dock_open={} active_panel={}",
+                                workspace
+                                    .panel::<collab_ui::collab_panel::CollabPanel>(cx)
+                                    .is_some(),
+                                workspace.right_dock().read(cx).is_open(),
+                                workspace
+                                    .right_dock()
+                                    .read(cx)
+                                    .active_panel()
+                                    .map(|panel| panel.persistent_name())
+                                    .unwrap_or("<none>")
+                            ));
+                        })
+                        .log_err();
+                }
+                Err(error) => {
+                    debug_collab_panel(format!(
+                        "initialize_panels: collab panel load failed: {error:#}"
+                    ));
+                }
+            }
+        }
+
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
+            add_collab_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle, prompt_builder, cx.clone()).map(|r| r.log_err()),
         );
@@ -951,7 +1015,7 @@ fn register_actions(
                             .insert(f32::from(theme_settings::clamp_font_size(buffer_font_size)).into());
                     });
                 } else {
-                    theme_settings::adjust_buffer_font_size(cx, |size| size + px(1.0));
+                    theme_settings::increase_buffer_font_size(cx);
                 }
             }
         })
@@ -968,7 +1032,7 @@ fn register_actions(
                             .insert(f32::from(theme_settings::clamp_font_size(buffer_font_size)).into());
                     });
                 } else {
-                    theme_settings::adjust_buffer_font_size(cx, |size| size - px(1.0));
+                    theme_settings::decrease_buffer_font_size(cx);
                 }
             }
         })
@@ -1693,12 +1757,21 @@ pub fn handle_keymap_file_changes(
     let (base_keymap_tx, mut base_keymap_rx) = mpsc::unbounded();
     let (keyboard_layout_tx, mut keyboard_layout_rx) = mpsc::unbounded();
     let mut old_base_keymap = *BaseKeymap::get_global(cx);
+    let mut old_vim_enabled = VimModeSetting::get_global(cx).0;
+    let mut old_helix_enabled = vim_mode_setting::HelixModeSetting::get_global(cx).0;
 
     cx.observe_global::<SettingsStore>(move |cx| {
         let new_base_keymap = *BaseKeymap::get_global(cx);
+        let new_vim_enabled = VimModeSetting::get_global(cx).0;
+        let new_helix_enabled = vim_mode_setting::HelixModeSetting::get_global(cx).0;
 
-        if new_base_keymap != old_base_keymap {
+        if new_base_keymap != old_base_keymap
+            || new_vim_enabled != old_vim_enabled
+            || new_helix_enabled != old_helix_enabled
+        {
             old_base_keymap = new_base_keymap;
+            old_vim_enabled = new_vim_enabled;
+            old_helix_enabled = new_helix_enabled;
 
             base_keymap_tx.unbounded_send(()).unwrap();
         }
@@ -1894,6 +1967,12 @@ pub fn load_default_keymap(cx: &mut App) {
     if let Some(asset_path) = base_keymap.asset_path() {
         cx.bind_keys(KeymapFile::load_asset(asset_path, Some(KeybindSource::Base), cx).unwrap());
     }
+
+    if VimModeSetting::get_global(cx).0 || vim_mode_setting::HelixModeSetting::get_global(cx).0 {
+        cx.bind_keys(
+            KeymapFile::load_asset(VIM_KEYMAP_PATH, Some(KeybindSource::Vim), cx).unwrap(),
+        );
+    }
 }
 
 pub fn open_new_ssh_project_from_project(
@@ -1919,6 +1998,7 @@ pub fn open_new_ssh_project_from_project(
             cx,
         )
         .await
+        .map(|_| ())
     })
 }
 
@@ -2272,8 +2352,8 @@ mod tests {
         DisplayPoint, Editor, MultiBufferOffset, SelectionEffects, display_map::DisplayRow,
     };
     use gpui::{
-        Action, AnyWindowHandle, App, AssetSource, BorrowAppContext, TestAppContext, UpdateGlobal,
-        VisualTestContext, WindowHandle, actions,
+        Action, AnyWindowHandle, App, AssetSource, BorrowAppContext, Modifiers, TestAppContext,
+        UpdateGlobal, VisualTestContext, WindowHandle, actions, point, px,
     };
     use language::LanguageRegistry;
     use languages::{markdown_lang, rust_lang};
@@ -2281,7 +2361,7 @@ mod tests {
     use project::{Project, ProjectPath};
     use semver::Version;
     use serde_json::json;
-    use settings::{SaturatingBool, SettingsStore, watch_config_file};
+    use settings::{KeymapFile, SaturatingBool, SettingsStore, VIM_KEYMAP_PATH, watch_config_file};
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
@@ -3923,6 +4003,159 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_editor_zoom_with_scroll_wheel(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/root"), json!({ "file.txt": "hello\nworld\n" }))
+            .await;
+
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+
+        let mouse_position = point(px(250.), px(250.));
+
+        let event_modifiers = {
+            #[cfg(target_os = "macos")]
+            {
+                Modifiers {
+                    platform: true,
+                    ..Modifiers::default()
+                }
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                }
+            }
+        };
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from(path!("/root/file.txt")),
+                    OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        // mouse_wheel_zoom is disabled by default — zoom should not work.
+        let initial_font_size =
+            cx.update(|_, cx| ThemeSettings::get_global(cx).buffer_font_size(cx).as_f32());
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: mouse_position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(1.))),
+            modifiers: event_modifiers,
+            ..Default::default()
+        });
+
+        let font_size_after_disabled_zoom =
+            cx.update(|_, cx| ThemeSettings::get_global(cx).buffer_font_size(cx).as_f32());
+
+        assert_eq!(
+            initial_font_size, font_size_after_disabled_zoom,
+            "Editor buffer font-size should not change when mouse_wheel_zoom is disabled"
+        );
+
+        // Enable mouse_wheel_zoom and verify zoom works.
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.mouse_wheel_zoom = Some(true);
+                });
+            });
+        });
+
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: mouse_position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(1.))),
+            modifiers: event_modifiers,
+            ..Default::default()
+        });
+
+        let increased_font_size =
+            cx.update(|_, cx| ThemeSettings::get_global(cx).buffer_font_size(cx).as_f32());
+
+        assert!(
+            increased_font_size > initial_font_size,
+            "Editor buffer font-size should have increased from scroll-zoom"
+        );
+
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: mouse_position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-1.))),
+            modifiers: event_modifiers,
+            ..Default::default()
+        });
+
+        let decreased_font_size =
+            cx.update(|_, cx| ThemeSettings::get_global(cx).buffer_font_size(cx).as_f32());
+
+        assert!(
+            decreased_font_size < increased_font_size,
+            "Editor buffer font-size should have decreased from scroll-zoom"
+        );
+
+        // Disable mouse_wheel_zoom again and verify zoom stops working.
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.mouse_wheel_zoom = Some(false);
+                });
+            });
+        });
+
+        let font_size_before =
+            cx.update(|_, cx| ThemeSettings::get_global(cx).buffer_font_size(cx).as_f32());
+
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: mouse_position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(1.))),
+            modifiers: event_modifiers,
+            ..Default::default()
+        });
+
+        let font_size_after =
+            cx.update(|_, cx| ThemeSettings::get_global(cx).buffer_font_size(cx).as_f32());
+
+        assert_eq!(
+            font_size_before, font_size_after,
+            "Editor buffer font-size should not change when mouse_wheel_zoom is re-disabled"
+        );
+    }
+
+    #[gpui::test]
     async fn test_navigation(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         app_state
@@ -4464,6 +4697,56 @@ mod tests {
     }
 
     actions!(test_only, [ActionA, ActionB]);
+
+    #[gpui::test]
+    async fn test_vim_keymap_asset_loads(cx: &mut gpui::TestAppContext) {
+        let _app_state = init_keymap_test(cx);
+
+        cx.update(|cx| {
+            vim::init(cx);
+
+            KeymapFile::load_asset(VIM_KEYMAP_PATH, Some(KeybindSource::Vim), cx)
+                .unwrap_or_else(|error| panic!("{error:#}"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_collab_panel_toggle_focus_opens_panel_once(cx: &mut gpui::TestAppContext) {
+        let app_state = init_test(cx);
+
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.close_panel_on_toggle = Some(true);
+            });
+        });
+
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(window.into(), collab_ui::collab_panel::ToggleFocus);
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace();
+                let workspace = workspace.read(cx);
+                let right_dock = workspace.right_dock().read(cx);
+
+                assert!(
+                    right_dock.is_open(),
+                    "Collab panel toggle should leave the dock open after one dispatch"
+                );
+                assert_eq!(
+                    right_dock
+                        .active_panel()
+                        .map(|panel| panel.persistent_name()),
+                    Some(collab_ui::collab_panel::CollabPanel::persistent_name()),
+                    "Collab panel toggle should activate the collab panel"
+                );
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     async fn test_base_keymap(cx: &mut gpui::TestAppContext) {
@@ -5012,6 +5295,8 @@ mod tests {
             gpui_tokio::init(cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             audio::init(cx);
+            channel::init(&app_state.client, app_state.user_store.clone(), cx);
+            call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
             notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
             workspace::init(app_state.clone(), cx);
             app_runtime_ui::init(cx);
@@ -5020,6 +5305,7 @@ mod tests {
             release_channel::init(Version::new(0, 0, 0), cx);
             command_palette::init(cx);
             editor::init(cx);
+            collab_ui::init(&app_state, cx);
             git_ui::init(cx);
             outline::init(cx);
             project_panel::init(cx);

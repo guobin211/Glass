@@ -1,8 +1,9 @@
 use anyhow::{Context as _, Result, anyhow};
 use serde::Deserialize;
+#[cfg(target_os = "macos")]
+use service_hub::ServiceAuthActionRequest;
 use service_hub::{
-    ServiceAuthActionRequest, ServiceCommandPlan, ServiceHub, ServiceOperationRequest,
-    ServiceWorkflowRequest,
+    ServiceCommandPlan, ServiceHub, ServiceOperationRequest, ServiceWorkflowRequest,
 };
 use util::command::new_command;
 
@@ -24,6 +25,7 @@ impl CommandExecution {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) async fn run_auth_action(request: ServiceAuthActionRequest) -> Result<()> {
     let plan = ServiceHub::default()
         .build_auth_action(&request)

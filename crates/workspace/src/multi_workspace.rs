@@ -1,20 +1,21 @@
 use agent_settings::AgentSettings;
 use anyhow::Result;
+use gpui::PathPromptOptions;
 #[cfg(target_os = "macos")]
 use gpui::native_sidebar;
-use gpui::PathPromptOptions;
-use gpui::{
-    AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, Pixels, Render, Subscription, Task, Tiling, Window, WindowBackgroundAppearance,
-    WindowId, actions,
-};
-use gpui::{MouseButton, deferred};
 #[cfg(not(target_os = "macos"))]
 use gpui::px;
-use project::{DirectoryLister, DisableAiSettings, Project, ProjectGroupKey};
+use gpui::{
+    AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    ManagedView, Pixels, Render, Subscription, Task, Tiling, Window, WindowId, actions,
+};
+use gpui::{MouseButton, deferred};
+use project::{DirectoryLister, Project, ProjectGroupKey};
+use remote::RemoteConnectionOptions;
 use settings::Settings;
 use settings::SidebarDockPosition;
 pub use settings::SidebarSide;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,20 +24,20 @@ use theme::ActiveTheme;
 use ui::prelude::*;
 use ui::{ContextMenu, right_click_menu};
 use util::ResultExt;
-use workspace_modes::{ModeId, ModeViewRegistry, RegisteredModeView};
 use util::path_list::PathList;
+use workspace_modes::{ModeId, ModeViewRegistry, RegisteredModeView};
 use zed_actions::agents_sidebar::ToggleThreadSwitcher;
 
 #[cfg(not(target_os = "macos"))]
 pub const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
+use crate::WorkspaceSidebarHost;
+use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
     Panel, Workspace, WorkspaceId, client_side_decorations,
     persistence::model::MultiWorkspaceState,
 };
-#[cfg(target_os = "macos")]
-use crate::WorkspaceSidebarHost;
 
 actions!(
     multi_workspace,
@@ -258,8 +259,8 @@ pub struct MultiWorkspace {
     workspaces: Vec<Entity<Workspace>>,
     active_workspace_index: usize,
     project_group_keys: Vec<ProjectGroupKey>,
+    provisional_project_group_keys: HashMap<EntityId, ProjectGroupKey>,
     sidebar: Option<Box<dyn SidebarHandle>>,
-    #[cfg(target_os = "macos")]
     workspace_sidebar_host: Entity<WorkspaceSidebarHost>,
     sidebar_open: bool,
     sidebar_has_notifications: bool,
@@ -296,7 +297,6 @@ impl MultiWorkspace {
         });
         let quit_subscription = cx.on_app_quit(Self::app_will_quit);
         Self::subscribe_to_workspace(&workspace, cx);
-        #[cfg(target_os = "macos")]
         let workspace_sidebar_host = {
             let left_dock = workspace.read(cx).left_dock().clone();
             let bottom_dock = workspace.read(cx).bottom_dock().clone();
@@ -308,8 +308,8 @@ impl MultiWorkspace {
             project_group_keys: vec![workspace.read(cx).project_group_key(cx)],
             workspaces: vec![workspace],
             active_workspace_index: 0,
+            provisional_project_group_keys: HashMap::default(),
             sidebar: None,
-            #[cfg(target_os = "macos")]
             workspace_sidebar_host,
             sidebar_open: false,
             sidebar_has_notifications: false,
@@ -345,7 +345,6 @@ impl MultiWorkspace {
             .cloned()
     }
 
-    #[cfg(target_os = "macos")]
     pub fn workspace_sidebar_host(&self) -> &Entity<WorkspaceSidebarHost> {
         &self.workspace_sidebar_host
     }
@@ -534,17 +533,24 @@ impl MultiWorkspace {
                         this.add_project_group_key(workspace.read(cx).project_group_key(cx));
                     }
                 }
+                project::Event::WorktreeUpdatedRootRepoCommonDir(_) => {
+                    if let Some(workspace) = workspace.upgrade() {
+                        this.maybe_clear_provisional_project_group_key(&workspace, cx);
+                        this.add_project_group_key(
+                            this.project_group_key_for_workspace(&workspace, cx),
+                        );
+                        this.remove_stale_project_group_keys(cx);
+                        cx.notify();
+                    }
+                }
                 _ => {}
             }
         })
         .detach();
 
-        cx.observe(workspace, |this, workspace, cx| {
-            #[cfg(target_os = "macos")]
-            {
-                if *this.workspace() == workspace {
-                    this.sync_workspace_sidebar_host(cx);
-                }
+        cx.observe(workspace, |_this, _observed_workspace, cx| {
+            if *_this.workspace() == _observed_workspace {
+                _this.sync_workspace_sidebar_host(cx);
             }
             cx.notify();
         })
@@ -560,9 +566,8 @@ impl MultiWorkspace {
     }
 
     /// Sync the shared unified sidebar to point at the active workspace's left dock,
-    /// selected section, dock roots, and hosted sidebar view. Width is NOT synced because the NSSplitView manages
-    /// its own divider position independently.
-    #[cfg(target_os = "macos")]
+    /// selected section, dock roots, and hosted sidebar view. Width is NOT synced because the
+    /// sidebar host manages its own divider position independently.
     fn sync_workspace_sidebar_host(&self, cx: &mut App) {
         let active_ws = self.workspace().clone();
         let (workspace_sidebar_surface, workspace_sidebar_view) = {
@@ -586,6 +591,61 @@ impl MultiWorkspace {
             return;
         }
         self.project_group_keys.push(project_group_key);
+    }
+
+    pub fn set_provisional_project_group_key(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        project_group_key: ProjectGroupKey,
+    ) {
+        self.provisional_project_group_keys
+            .insert(workspace.entity_id(), project_group_key.clone());
+        self.add_project_group_key(project_group_key);
+    }
+
+    pub(crate) fn set_workspace_group_key(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        project_group_key: ProjectGroupKey,
+    ) {
+        self.set_provisional_project_group_key(workspace, project_group_key);
+    }
+
+    pub fn project_group_key_for_workspace(
+        &self,
+        workspace: &Entity<Workspace>,
+        cx: &App,
+    ) -> ProjectGroupKey {
+        self.provisional_project_group_keys
+            .get(&workspace.entity_id())
+            .cloned()
+            .unwrap_or_else(|| workspace.read(cx).project_group_key(cx))
+    }
+
+    fn maybe_clear_provisional_project_group_key(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        cx: &App,
+    ) {
+        let live_key = workspace.read(cx).project_group_key(cx);
+        if self
+            .provisional_project_group_keys
+            .get(&workspace.entity_id())
+            .is_some_and(|key| *key == live_key)
+        {
+            self.provisional_project_group_keys
+                .remove(&workspace.entity_id());
+        }
+    }
+
+    fn remove_stale_project_group_keys(&mut self, cx: &App) {
+        let workspace_keys: HashSet<ProjectGroupKey> = self
+            .workspaces
+            .iter()
+            .map(|workspace| self.project_group_key_for_workspace(workspace, cx))
+            .collect();
+        self.project_group_keys
+            .retain(|key| workspace_keys.contains(key));
     }
 
     pub fn restore_project_group_keys(&mut self, keys: Vec<ProjectGroupKey>) {
@@ -614,7 +674,7 @@ impl MultiWorkspace {
             .map(|key| (key.clone(), Vec::new()))
             .collect::<Vec<_>>();
         for workspace in &self.workspaces {
-            let key = workspace.read(cx).project_group_key(cx);
+            let key = self.project_group_key_for_workspace(workspace, cx);
             if let Some((_, workspaces)) = groups.iter_mut().find(|(k, _)| k == &key) {
                 workspaces.push(workspace.clone());
             }
@@ -627,9 +687,9 @@ impl MultiWorkspace {
         project_group_key: &ProjectGroupKey,
         cx: &App,
     ) -> impl Iterator<Item = &Entity<Workspace>> {
-        self.workspaces
-            .iter()
-            .filter(move |ws| ws.read(cx).project_group_key(cx) == *project_group_key)
+        self.workspaces.iter().filter(move |workspace| {
+            self.project_group_key_for_workspace(workspace, cx) == *project_group_key
+        })
     }
 
     pub fn remove_folder_from_project_group(
@@ -750,6 +810,102 @@ impl MultiWorkspace {
         cx.notify();
     }
 
+    /// Finds an existing workspace whose root paths and host exactly match.
+    pub fn workspace_for_paths(
+        &self,
+        path_list: &PathList,
+        host: Option<&RemoteConnectionOptions>,
+        cx: &App,
+    ) -> Option<Entity<Workspace>> {
+        self.workspaces
+            .iter()
+            .find(|ws| {
+                let key = self.project_group_key_for_workspace(ws, cx);
+                key.host().as_ref() == host
+                    && PathList::new(&ws.read(cx).root_paths(cx)) == *path_list
+            })
+            .cloned()
+    }
+
+    /// Finds an existing workspace whose paths match, or creates a new one.
+    ///
+    /// For local projects (`host` is `None`), this delegates to
+    /// [`Self::find_or_create_local_workspace`]. For remote projects, it
+    /// tries an exact path match and, if no existing workspace is found,
+    /// calls `connect_remote` to establish a connection and creates a new
+    /// remote workspace.
+    ///
+    /// The `connect_remote` closure is responsible for any user-facing
+    /// connection UI (e.g. password prompts). It receives the connection
+    /// options and should return a [`Task`] that resolves to the
+    /// [`RemoteClient`] session, or `None` if the connection was
+    /// cancelled.
+    pub fn find_or_create_workspace(
+        &mut self,
+        paths: PathList,
+        host: Option<RemoteConnectionOptions>,
+        provisional_project_group_key: Option<ProjectGroupKey>,
+        connect_remote: impl FnOnce(
+            RemoteConnectionOptions,
+            &mut Window,
+            &mut Context<Self>,
+        ) -> Task<Result<Option<Entity<remote::RemoteClient>>>>
+        + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Workspace>>> {
+        if let Some(workspace) = self.workspace_for_paths(&paths, host.as_ref(), cx) {
+            self.activate(workspace.clone(), cx);
+            return Task::ready(Ok(workspace));
+        }
+
+        let Some(connection_options) = host else {
+            return self.find_or_create_local_workspace(paths, window, cx);
+        };
+
+        let app_state = self.workspace().read(cx).app_state().clone();
+        let window_handle = window.window_handle().downcast::<MultiWorkspace>();
+        let connect_task = connect_remote(connection_options.clone(), window, cx);
+        let paths_vec = paths.paths().to_vec();
+
+        cx.spawn(async move |_this, cx| {
+            let session = connect_task
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Remote connection was cancelled"))?;
+
+            let new_project = cx.update(|cx| {
+                Project::remote(
+                    session,
+                    app_state.client.clone(),
+                    app_state.node_runtime.clone(),
+                    app_state.user_store.clone(),
+                    app_state.languages.clone(),
+                    app_state.fs.clone(),
+                    true,
+                    cx,
+                )
+            });
+
+            let window_handle =
+                window_handle.ok_or_else(|| anyhow::anyhow!("Window is not a MultiWorkspace"))?;
+
+            open_remote_project_with_existing_connection(
+                connection_options,
+                new_project,
+                paths_vec,
+                app_state,
+                window_handle,
+                provisional_project_group_key,
+                cx,
+            )
+            .await?;
+
+            window_handle.update(cx, |multi_workspace, _window, _cx| {
+                multi_workspace.workspace().clone()
+            })
+        })
+    }
+
     /// Finds an existing workspace in this multi-workspace whose paths match,
     /// or creates a new one (deserializing its saved state from the database).
     /// Never searches other windows or matches workspaces with a superset of
@@ -760,12 +916,7 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        if let Some(workspace) = self
-            .workspaces
-            .iter()
-            .find(|ws| PathList::new(&ws.read(cx).root_paths(cx)) == path_list)
-            .cloned()
-        {
+        if let Some(workspace) = self.workspace_for_paths(&path_list, None, cx) {
             self.activate(workspace.clone(), cx);
             return Task::ready(Ok(workspace));
         }
@@ -840,20 +991,12 @@ impl MultiWorkspace {
             workspace.invalidate_window_caches(window, cx);
             cx.notify();
         });
-        #[cfg(target_os = "macos")]
         self.sync_workspace_sidebar_host(cx);
         self.focus_active_workspace(window, cx);
         if changed {
             cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
             self.serialize(cx);
         }
-        cx.notify();
-    }
-
-    fn set_single_workspace(&mut self, workspace: Entity<Workspace>, cx: &mut Context<Self>) {
-        self.workspaces[0] = workspace;
-        self.active_workspace_index = 0;
-        cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
         cx.notify();
     }
 
@@ -885,7 +1028,7 @@ impl MultiWorkspace {
                     workspace.set_shared_mode_view(*mode_id, mode_view.clone(), cx);
                 });
             }
-            let project_group_key = workspace.read(cx).project().read(cx).project_group_key(cx);
+            let project_group_key = self.project_group_key_for_workspace(&workspace, cx);
 
             Self::subscribe_to_workspace(&workspace, cx);
             self.add_project_group_key(project_group_key);
@@ -922,7 +1065,6 @@ impl MultiWorkspace {
             workspace.invalidate_window_caches(window, cx);
             cx.notify();
         });
-        #[cfg(target_os = "macos")]
         self.sync_workspace_sidebar_host(cx);
         self.serialize(cx);
         self.focus_active_workspace(window, cx);
@@ -943,7 +1085,6 @@ impl MultiWorkspace {
             workspace.invalidate_window_caches(window, cx);
             cx.notify();
         });
-        #[cfg(target_os = "macos")]
         self.sync_workspace_sidebar_host(cx);
         self.serialize(cx);
         self.focus_active_workspace(window, cx);
@@ -1401,66 +1542,9 @@ impl MultiWorkspace {
 
 impl Render for MultiWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(target_os = "macos")]
         self.sync_workspace_sidebar_host(cx);
 
         let multi_workspace_enabled = self.multi_workspace_enabled(cx);
-        #[cfg(not(target_os = "macos"))]
-        let sidebar = if multi_workspace_enabled && self.sidebar_open() {
-            self.sidebar.as_ref().map(|sidebar_handle| {
-                let weak = cx.weak_entity();
-                let sidebar_width = sidebar_handle.width(cx);
-                let resize_handle = deferred(
-                    div()
-                        .id("sidebar-resize-handle")
-                        .absolute()
-                        .right(-SIDEBAR_RESIZE_HANDLE_SIZE / 2.)
-                        .top(px(0.))
-                        .h_full()
-                        .w(SIDEBAR_RESIZE_HANDLE_SIZE)
-                        .cursor_col_resize()
-                        .on_drag(DraggedSidebar, |dragged, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.new(|_| dragged.clone())
-                        })
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
-                        .on_mouse_up(MouseButton::Left, move |event, _, cx| {
-                            if event.click_count == 2 {
-                                weak.update(cx, |this, cx| {
-                                    if let Some(sidebar) = this.sidebar.as_mut() {
-                                        sidebar.set_width(None, cx);
-                                    }
-                                    this.serialize(cx);
-                                })
-                                .ok();
-                                cx.stop_propagation();
-                            } else {
-                                weak.update(cx, |this, cx| {
-                                    this.serialize(cx);
-                                })
-                                .ok();
-                            }
-                        })
-                        .occlude(),
-                );
-
-                div()
-                    .id("sidebar-container")
-                    .relative()
-                    .h_full()
-                    .w(sidebar_width)
-                    .flex_shrink_0()
-                    .child(sidebar_handle.to_any())
-                    .child(resize_handle)
-                    .into_any_element()
-            })
-        } else {
-            None
-        };
-        #[cfg(target_os = "macos")]
-        let sidebar: Option<AnyView> = None;
 
         let ui_font = theme_settings::setup_ui_font(window, cx);
         let text_color = cx.theme().colors().text;
@@ -1527,13 +1611,12 @@ impl Render for MultiWorkspace {
                     |this| {
                         this.on_drag_move(cx.listener(
                             |this: &mut Self, e: &DragMoveEvent<DraggedSidebar>, _window, cx| {
-                                if let Some(sidebar) = &this.sidebar {
-                                    let new_width = e.event.position.x;
-                                    sidebar.set_width(Some(new_width), cx);
-                                }
+                                let new_width = e.event.position.x;
+                                this.workspace_sidebar_host.update(cx, |sidebar, cx| {
+                                    sidebar.set_width(f64::from(new_width), cx);
+                                });
                             },
                         ))
-                        .children(sidebar)
                     },
                 )
                 .on_action(
@@ -1554,61 +1637,139 @@ impl Render for MultiWorkspace {
                         .overflow_hidden()
                         .child(self.workspace().clone());
 
-                    #[cfg(target_os = "macos")]
                     let workspace_content = {
                         let workspace = self.workspace().read(cx);
-                        let sidebar_collapsed =
-                            workspace.workspace_sidebar_host_collapsed(window, cx);
                         let sidebar_width = self.workspace_sidebar_host.read(cx).width();
                         let button_bar = workspace.button_bar(cx);
-                        let sidebar_titlebar_fill = match cx.theme().window_background_appearance()
-                        {
-                            WindowBackgroundAppearance::Opaque => {
-                                Some(cx.theme().colors().panel_background)
-                            }
-                            _ => None,
-                        };
 
-                        if cfg!(any(test, feature = "test-support")) {
+                        #[cfg(not(target_os = "macos"))]
+                        let sidebar_collapsed = !self.sidebar_open();
+
+                        #[cfg(target_os = "macos")]
+                        let sidebar_collapsed =
+                            workspace.workspace_sidebar_host_collapsed(window, cx);
+
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let weak = cx.weak_entity();
+                            let resize_handle = deferred(
+                                div()
+                                    .id("workspace-sidebar-resize-handle")
+                                    .absolute()
+                                    .right(-SIDEBAR_RESIZE_HANDLE_SIZE / 2.)
+                                    .top(px(0.))
+                                    .h_full()
+                                    .w(SIDEBAR_RESIZE_HANDLE_SIZE)
+                                    .cursor_col_resize()
+                                    .on_drag(DraggedSidebar, |dragged, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.new(|_| dragged.clone())
+                                    })
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_mouse_up(MouseButton::Left, move |event, _, cx| {
+                                        if event.click_count == 2 {
+                                            weak.update(cx, |this, cx| {
+                                                this.workspace_sidebar_host.update(
+                                                    cx,
+                                                    |sidebar, cx| {
+                                                        sidebar.set_width(240.0, cx);
+                                                    },
+                                                );
+                                                this.serialize(cx);
+                                            })
+                                            .ok();
+                                            cx.stop_propagation();
+                                        } else {
+                                            weak.update(cx, |this, cx| {
+                                                this.serialize(cx);
+                                            })
+                                            .ok();
+                                        }
+                                    })
+                                    .occlude(),
+                            );
+
                             div()
                                 .size_full()
                                 .flex()
                                 .flex_row()
-                                .child(
-                                    div()
-                                        .w(px(sidebar_width as f32))
-                                        .min_w(px(160.0))
-                                        .max_w(px(480.0))
-                                        .when(sidebar_collapsed, |this| {
-                                            this.w(px(0.0)).overflow_hidden()
-                                        })
-                                        .child(self.workspace_sidebar_host.clone()),
-                                )
+                                .when(!sidebar_collapsed, |this| {
+                                    this.child(
+                                        div()
+                                            .id("workspace-sidebar-host-shell")
+                                            .relative()
+                                            .h_full()
+                                            .w(px(sidebar_width as f32))
+                                            .min_w(px(160.0))
+                                            .max_w(px(480.0))
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .flex_col()
+                                            .overflow_hidden()
+                                            .bg(cx.theme().colors().panel_background)
+                                            .when_some(button_bar, |this, dock_button_bar| {
+                                                this.child(dock_button_bar)
+                                            })
+                                            .child(self.workspace_sidebar_host.clone())
+                                            .child(resize_handle),
+                                    )
+                                })
                                 .child(workspace_content)
-                        } else {
-                            div()
-                                .size_full()
-                                .flex()
-                                .flex_row()
-                                .child(
-                                    native_sidebar("workspace-sidebar-host-shell", &[""; 0])
-                                        .when_some(button_bar, |this, dock_button_bar| {
-                                            this.header_view(
-                                                dock_button_bar,
-                                                crate::dock::DockButtonBar::NATIVE_SIDEBAR_HEIGHT,
-                                            )
-                                        })
-                                        .sidebar_view(self.workspace_sidebar_host.clone())
-                                        .sidebar_width(sidebar_width)
-                                        .min_sidebar_width(160.0)
-                                        .max_sidebar_width(480.0)
-                                        .manage_window_chrome(false)
-                                        .manage_toolbar(false)
-                                        .collapsed(sidebar_collapsed)
-                                        .sidebar_background_color(sidebar_titlebar_fill)
-                                        .size_full(),
-                                )
-                                .child(workspace_content)
+                        }
+
+                        #[cfg(target_os = "macos")]
+                        {
+                            let sidebar_titlebar_fill =
+                                match cx.theme().window_background_appearance() {
+                                    gpui::WindowBackgroundAppearance::Opaque => {
+                                        Some(cx.theme().colors().panel_background)
+                                    }
+                                    _ => None,
+                                };
+
+                            if cfg!(any(test, feature = "test-support")) {
+                                div()
+                                    .size_full()
+                                    .flex()
+                                    .flex_row()
+                                    .child(
+                                        div()
+                                            .w(px(sidebar_width as f32))
+                                            .min_w(px(160.0))
+                                            .max_w(px(480.0))
+                                            .when(sidebar_collapsed, |this| {
+                                                this.w(px(0.0)).overflow_hidden()
+                                            })
+                                            .child(self.workspace_sidebar_host.clone()),
+                                    )
+                                    .child(workspace_content)
+                            } else {
+                                div()
+                                    .size_full()
+                                    .flex()
+                                    .flex_row()
+                                    .child(
+                                        native_sidebar("workspace-sidebar-host-shell", &[""; 0])
+                                            .when_some(button_bar, |this, dock_button_bar| {
+                                                this.header_view(
+                                                    dock_button_bar,
+                                                    crate::dock::DockButtonBar::NATIVE_SIDEBAR_HEIGHT,
+                                                )
+                                            })
+                                            .sidebar_view(self.workspace_sidebar_host.clone())
+                                            .sidebar_width(sidebar_width)
+                                            .min_sidebar_width(160.0)
+                                            .max_sidebar_width(480.0)
+                                            .manage_window_chrome(false)
+                                            .manage_toolbar(false)
+                                            .collapsed(sidebar_collapsed)
+                                            .sidebar_background_color(sidebar_titlebar_fill)
+                                            .size_full(),
+                                    )
+                                    .child(workspace_content)
+                            }
                         }
                     };
 
@@ -1646,6 +1807,7 @@ mod tests {
     use feature_flags::FeatureFlagAppExt;
     use fs::FakeFs;
     use gpui::{Context, FocusHandle, Focusable, Render, TestAppContext, div};
+    use project::DisableAiSettings;
     use settings::{Settings, SettingsStore};
     use std::sync::Arc;
     use workspace_modes::RegisteredModeView;

@@ -7,7 +7,7 @@ mod zed;
 use agent::{SharedThread, ThreadStore};
 use agent_client_protocol;
 use agent_ui::AgentPanel;
-use anyhow::{Context as _, Error, Result};
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
 use client::{Client, ProxySettings, RefreshLlmTokenListener, UserStore, parse_zed_link};
@@ -17,7 +17,7 @@ use db::kvp::{GlobalKeyValueStore, KeyValueStore};
 use editor::Editor;
 use extension::ExtensionHostProxy;
 use fs::{Fs, RealFs};
-use futures::{StreamExt, channel::oneshot, future};
+use futures::{StreamExt, channel::oneshot};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{App, AppContext, AsyncApp, Focusable as _, QuitMode, UpdateGlobal as _};
@@ -180,7 +180,7 @@ fn main() {
 
     // Handle CEF subprocess execution VERY early, before any other initialization.
     // If this is a CEF subprocess, it will not return (calls process::exit).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Err(e) = browser::handle_cef_subprocess() {
         // Log error but don't fail - CEF might not be available (not running from bundle)
         eprintln!("CEF subprocess handling warning: {}", e);
@@ -727,6 +727,7 @@ fn main() {
         outline_panel::init(cx);
         tasks_ui::init(cx);
         snippets_ui::init(cx);
+        channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
         search::init(cx);
         cx.set_global(workspace::PaneSearchBarCallbacks {
             setup_search_bar: |languages, toolbar, window, cx| {
@@ -737,6 +738,7 @@ fn main() {
             },
             wrap_div_with_search_actions: search::buffer_search::register_pane_search_actions,
         });
+        vim::init(cx);
         terminal_view::init(cx);
         browser::init(cx);
         encoding_selector::init(cx);
@@ -746,8 +748,9 @@ fn main() {
         theme_selector::init(cx);
         settings_profile_selector::init(cx);
         language_tools::init(cx);
+        call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-        title_bar::init(cx);
+        collab_ui::init(&app_state, cx);
         git_ui::init(cx);
         git_graph::init(cx);
         feedback::init(cx);
@@ -1330,54 +1333,57 @@ pub(crate) async fn restore_or_create_workspace(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let kvp = cx.update(|cx| KeyValueStore::global(cx));
-    if let Some((multi_workspaces, remote_workspaces)) = restorable_workspaces(cx, &app_state).await
-    {
-        let mut results: Vec<Result<(), Error>> = Vec::new();
-        let mut tasks = Vec::new();
-
-        for multi_workspace in multi_workspaces {
-            if let Err(error) = restore_multiworkspace(multi_workspace, app_state.clone(), cx).await
-            {
-                log::error!("Failed to restore workspace: {error:#}");
-                results.push(Err(error));
-            }
-        }
-
-        for session_workspace in remote_workspaces {
-            let app_state = app_state.clone();
-            let SerializedWorkspaceLocation::Remote(mut connection_options) =
-                session_workspace.location
-            else {
-                continue;
-            };
-            let paths = session_workspace.paths;
-            if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
-                cx.update(|cx| {
-                    RemoteSettings::get_global(cx).fill_connection_options_from_settings(options)
-                });
-            }
-            let task = cx.spawn(async move |cx| {
-                recent_projects::open_remote_project(
-                    connection_options,
-                    paths.paths().iter().map(PathBuf::from).collect(),
-                    app_state,
-                    workspace::OpenOptions::default(),
-                    cx,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!(e))
-            });
-            tasks.push(task);
-        }
-
-        // Wait for all window groups and remote workspaces to open concurrently
-        results.extend(future::join_all(tasks).await);
-
-        // Show notifications for any errors that occurred
+    if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
         let mut error_count = 0;
-        for result in results {
-            if let Err(e) = result {
-                log::error!("Failed to restore workspace: {}", e);
+        for multi_workspace in multi_workspaces {
+            let result = match &multi_workspace.active_workspace.location {
+                SerializedWorkspaceLocation::Local => {
+                    restore_multiworkspace(multi_workspace, app_state.clone(), cx)
+                        .await
+                        .map(|_| ())
+                }
+                SerializedWorkspaceLocation::Remote(connection_options) => {
+                    let mut connection_options = connection_options.clone();
+                    if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
+                        cx.update(|cx| {
+                            RemoteSettings::get_global(cx)
+                                .fill_connection_options_from_settings(options)
+                        });
+                    }
+
+                    let paths = multi_workspace
+                        .active_workspace
+                        .paths
+                        .paths()
+                        .iter()
+                        .map(PathBuf::from)
+                        .collect::<Vec<_>>();
+                    let state = multi_workspace.state.clone();
+                    async {
+                        let window = open_remote_project(
+                            connection_options,
+                            paths,
+                            app_state.clone(),
+                            workspace::OpenOptions::default(),
+                            cx,
+                        )
+                        .await?;
+                        workspace::apply_restored_multiworkspace_state(
+                            window,
+                            &state,
+                            multi_workspace.active_workspace.workspace_id,
+                            app_state.fs.clone(),
+                            cx,
+                        )
+                        .await;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await
+                }
+            };
+
+            if let Err(error) = result {
+                log::error!("Failed to restore workspace: {error:#}");
                 error_count += 1;
             }
         }
@@ -1460,17 +1466,9 @@ pub(crate) async fn restore_or_create_workspace(
 async fn restorable_workspaces(
     cx: &mut AsyncApp,
     app_state: &Arc<AppState>,
-) -> Option<(
-    Vec<workspace::SerializedMultiWorkspace>,
-    Vec<SessionWorkspace>,
-)> {
+) -> Option<Vec<workspace::SerializedMultiWorkspace>> {
     let locations = restorable_workspace_locations(cx, app_state).await?;
-    let (remote_workspaces, local_workspaces) = locations
-        .into_iter()
-        .partition(|sw| matches!(sw.location, SerializedWorkspaceLocation::Remote(_)));
-    let multi_workspaces =
-        cx.update(|cx| workspace::read_serialized_multi_workspaces(local_workspaces, cx));
-    Some((multi_workspaces, remote_workspaces))
+    Some(cx.update(|cx| workspace::read_serialized_multi_workspaces(locations, cx)))
 }
 
 pub(crate) async fn restorable_workspace_locations(
